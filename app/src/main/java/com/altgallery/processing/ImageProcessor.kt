@@ -52,49 +52,49 @@ class ImageProcessor @Inject constructor(
             val ocr = ocrEngine.recognize(uri)
             val labels = labelEngine.label(uri)
 
-            val ocrText = ocr.text.trim().takeIf { it.isNotEmpty() }
+            val ocrText = RecordAssembler.normalizeOcr(ocr.text)
             val labelTexts = labels.map { it.text }
 
-            // MediaStore dims are the source of truth; fall back to decoded
-            // bitmap dims when the library reports 0 (some devices do).
-            val width = image.width.takeIf { it > 0 } ?: bitmap?.width ?: 0
-            val height = image.height.takeIf { it > 0 } ?: bitmap?.height ?: 0
+            // Effective dims: library wins, decoded bitmap fills gaps — and the
+            // effective values are what get persisted (AC1), so records never
+            // carry 0/0 when the bitmap gave real dimensions.
+            val (width, height) = RecordAssembler.resolveDimensions(
+                image.width, image.height, bitmap?.width, bitmap?.height,
+            )
             val isMeme = memeClassifier.classify(ocr, labels, width, height, bitmap)
 
             val description = captionEngine.caption(bitmap, labels, ocrText ?: "")
             val tags = tagExtractor.extract(labelTexts, ocrText ?: "", description)
-            val vector = embeddingEngine.embed(description)
-
-            val metadata = ImageMetadata(
+            val assembled = RecordAssembler.assemble(
                 contentUri = image.uriString,
                 displayName = image.displayName,
-                filePath = null,
                 dateTaken = image.dateTaken,
-                width = image.width,
-                height = image.height,
+                width = width,
+                height = height,
                 mimeType = image.mimeType,
                 isMeme = isMeme,
                 description = description,
                 ocrText = ocrText,
-                labels = labelTexts.joinToString(","),
-                tags = tags.joinToString(","),
-                clusterId = UNCLUSTERED,
+                labelTexts = labelTexts,
+                tags = tags,
                 processedAt = System.currentTimeMillis(),
-                modelVersion = MODEL_VERSION,
-                embeddingId = null,
             )
 
-            // Single transaction lands metadata + embedding + FTS together.
-            return metadataRepository.saveCompleteRecord(metadata, vector)
+            // Embed-then-save tail (AC5): a throw here skips the write, so the
+            // photo stays not done; the repo transaction lands metadata +
+            // embedding + FTS together on success.
+            return RecordAssembler.complete(assembled.metadata.description, embeddingEngine::embed) { vector ->
+                metadataRepository.saveCompleteRecord(assembled.metadata, vector)
+            }
         } finally {
             if (bitmap?.isRecycled == false) bitmap.recycle()
         }
     }
 
     companion object {
-        const val MODEL_VERSION = "altgallery-v0.1"
+        const val MODEL_VERSION = RecordAssembler.MODEL_VERSION
 
         /** Placeholder folder assignment until M5 clustering runs. */
-        const val UNCLUSTERED = "unclustered"
+        const val UNCLUSTERED = RecordAssembler.UNCLUSTERED
     }
 }
