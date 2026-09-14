@@ -11,8 +11,11 @@ import com.altgallery.data.model.ImageMetadataFts
  * - AC1: [resolveDimensions] fills MediaStore gaps from the decoded bitmap,
  *   and [assemble] persists the effective dims (never raw 0/0 when the bitmap
  *   gave real ones).
- * - AC2: [assemble] derives the FTS row by mirroring the metadata text fields,
- *   so the record is text-findable the moment it lands.
+ * - AC2: [assemble] derives the FTS row via [ftsFor] by mirroring the
+ *   metadata text fields, so the record is text-findable the moment it lands.
+ *   [ftsFor] is the single derivation point: [processPhoto] hands the assembled
+ *   FTS row to the repository, which persists it as given instead of
+ *   re-deriving it, so the copy the tests pin is the copy that ships.
  * - AC3: stateless object, fresh collections per call — no shared state between
  *   photos.
  * - AC4: [assemble] rejects a blank description; the blank-input path
@@ -20,6 +23,11 @@ import com.altgallery.data.model.ImageMetadataFts
  *   via the captioner + [com.altgallery.ml.TagExtractor] defaults.
  * - AC5: [complete] runs [save] only after [embed] succeeds; an embedding
  *   failure (e.g. absent model files) propagates with nothing recorded.
+ * - Wiring: [processPhoto] is the pure, JVM-testable orchestration of the
+ *   per-photo tail (normalize → resolve dims → classify → describe → tag →
+ *   assemble → embed-then-save). `ImageProcessor.process` maps Android types
+ *   to primitives and delegates here, so the wiring the dims bug lived in is
+ *   pinned by tests.
  */
 data class AssembledRecord(
     val metadata: ImageMetadata,
@@ -92,16 +100,23 @@ object RecordAssembler {
             modelVersion = modelVersion,
             embeddingId = null,
         )
-        val fts = ImageMetadataFts(
-            contentUri = metadata.contentUri,
-            displayName = metadata.displayName,
-            description = metadata.description,
-            ocrText = metadata.ocrText,
-            labels = metadata.labels,
-            tags = metadata.tags,
-        )
-        return AssembledRecord(metadata, fts)
+        return AssembledRecord(metadata, ftsFor(metadata))
     }
+
+    /**
+     * Single derivation point for the FTS row: mirrors the metadata text
+     * fields. [assemble] builds the shipped row through this, and the
+     * repository persists that row as given — so there is exactly one copy
+     * and the tested copy is the shipped copy.
+     */
+    fun ftsFor(metadata: ImageMetadata): ImageMetadataFts = ImageMetadataFts(
+        contentUri = metadata.contentUri,
+        displayName = metadata.displayName,
+        description = metadata.description,
+        ocrText = metadata.ocrText,
+        labels = metadata.labels,
+        tags = metadata.tags,
+    )
 
     /**
      * Embed-then-save tail: [save] runs only after [embed] returns. If [embed]
@@ -114,4 +129,61 @@ object RecordAssembler {
         embed: suspend (String) -> FloatArray,
         save: suspend (FloatArray) -> ImageMetadata,
     ): ImageMetadata = save(embed(description))
+
+    /**
+     * Pure per-photo orchestration tail (no Android types).
+     *
+     * Owns the exact wiring the dims bug lived in: raw library dims +
+     * decoded-bitmap dims resolve to the effective values, the classifier
+     * observes those effective values, and the assembled metadata + assembled
+     * FTS row are what reach [save] via [complete] (embed-then-save, so an
+     * embed throw skips the write). Stage lambdas close over Android objects
+     * in `ImageProcessor.process`, keeping this runnable on the plain JVM.
+     */
+    @Suppress("LongParameterList")
+    suspend fun processPhoto(
+        contentUri: String,
+        displayName: String,
+        dateTaken: Long,
+        mimeType: String,
+        imageWidth: Int,
+        imageHeight: Int,
+        bitmapWidth: Int?,
+        bitmapHeight: Int?,
+        ocrRaw: String,
+        labelTexts: List<String>,
+        clusterId: String = UNCLUSTERED,
+        processedAt: Long,
+        modelVersion: String = MODEL_VERSION,
+        classify: (ocrText: String?, labelTexts: List<String>, width: Int, height: Int) -> Boolean,
+        describe: suspend (ocrText: String) -> String,
+        tag: (ocrText: String, description: String) -> List<String>,
+        embed: suspend (String) -> FloatArray,
+        save: suspend (metadata: ImageMetadata, fts: ImageMetadataFts, vector: FloatArray) -> ImageMetadata,
+    ): ImageMetadata {
+        val ocrText = normalizeOcr(ocrRaw)
+        val (width, height) = resolveDimensions(imageWidth, imageHeight, bitmapWidth, bitmapHeight)
+        val isMeme = classify(ocrText, labelTexts, width, height)
+        val description = describe(ocrText ?: "")
+        val tags = tag(ocrText ?: "", description)
+        val assembled = assemble(
+            contentUri = contentUri,
+            displayName = displayName,
+            dateTaken = dateTaken,
+            width = width,
+            height = height,
+            mimeType = mimeType,
+            isMeme = isMeme,
+            description = description,
+            ocrText = ocrText,
+            labelTexts = labelTexts,
+            tags = tags,
+            clusterId = clusterId,
+            processedAt = processedAt,
+            modelVersion = modelVersion,
+        )
+        return complete(assembled.metadata.description, embed) { vector ->
+            save(assembled.metadata, assembled.fts, vector)
+        }
+    }
 }

@@ -15,9 +15,12 @@ import javax.inject.Singleton
  * Persists fully-processed photo records.
  *
  * The pipeline core (INDX-001) builds an [ImageMetadata], its embedding vector,
- * and its FTS row in memory, then lands them here in a single Room transaction.
- * Either all three land together or nothing does — a photo is never marked done
- * unless it is fully recorded and immediately findable by text search.
+ * and its FTS row in memory (see `RecordAssembler`, the single FTS derivation
+ * point), then lands them here in a single Room transaction. Either all three
+ * land together or nothing does — a photo is never marked done unless it is
+ * fully recorded and immediately findable by text search. The FTS row is
+ * persisted as given, not re-derived, so the copy the tests pin is the copy
+ * that ships.
  *
  * Re-processing the same content URI is idempotent: stale embedding + FTS rows
  * for that URI are removed inside the same transaction before the fresh rows
@@ -33,18 +36,19 @@ class MetadataRepository @Inject constructor(
      * Atomically writes one complete indexed record.
      *
      * @param metadata record without [ImageMetadata.embeddingId] (resolved here).
+     * @param fts the caller-built search row for [metadata] (see
+     *   `RecordAssembler.ftsFor`); persisted as given.
      * @param vector unit-normalized embedding for [metadata.description].
      * @return the persisted [ImageMetadata] with [ImageMetadata.embeddingId] set.
      */
-    suspend fun saveCompleteRecord(metadata: ImageMetadata, vector: FloatArray): ImageMetadata {
-        val fts = ImageMetadataFts(
-            contentUri = metadata.contentUri,
-            displayName = metadata.displayName,
-            description = metadata.description,
-            ocrText = metadata.ocrText,
-            labels = metadata.labels,
-            tags = metadata.tags,
-        )
+    suspend fun saveCompleteRecord(
+        metadata: ImageMetadata,
+        fts: ImageMetadataFts,
+        vector: FloatArray,
+    ): ImageMetadata {
+        require(metadata.contentUri == fts.contentUri) {
+            "metadata and FTS rows must share the content URI"
+        }
         val embeddingId = db.withTransaction {
             embeddingDao.deleteByUri(metadata.contentUri)
             metadataDao.deleteFtsByUri(metadata.contentUri)

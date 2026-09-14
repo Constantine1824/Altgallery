@@ -51,41 +51,34 @@ class ImageProcessor @Inject constructor(
             // ML stages first — all must succeed before anything is recorded.
             val ocr = ocrEngine.recognize(uri)
             val labels = labelEngine.label(uri)
-
-            val ocrText = RecordAssembler.normalizeOcr(ocr.text)
             val labelTexts = labels.map { it.text }
 
-            // Effective dims: library wins, decoded bitmap fills gaps — and the
-            // effective values are what get persisted (AC1), so records never
-            // carry 0/0 when the bitmap gave real dimensions.
-            val (width, height) = RecordAssembler.resolveDimensions(
-                image.width, image.height, bitmap?.width, bitmap?.height,
-            )
-            val isMeme = memeClassifier.classify(ocr, labels, width, height, bitmap)
-
-            val description = captionEngine.caption(bitmap, labels, ocrText ?: "")
-            val tags = tagExtractor.extract(labelTexts, ocrText ?: "", description)
-            val assembled = RecordAssembler.assemble(
+            // Pure tail owns the wiring (normalize → effective dims → classify
+            // → describe → tag → assemble → embed-then-save). Stage lambdas
+            // close over the Android objects; the tail itself is JVM-testable
+            // (see RecordAssembler.processPhoto).
+            return RecordAssembler.processPhoto(
                 contentUri = image.uriString,
                 displayName = image.displayName,
                 dateTaken = image.dateTaken,
-                width = width,
-                height = height,
                 mimeType = image.mimeType,
-                isMeme = isMeme,
-                description = description,
-                ocrText = ocrText,
+                imageWidth = image.width,
+                imageHeight = image.height,
+                bitmapWidth = bitmap?.width,
+                bitmapHeight = bitmap?.height,
+                ocrRaw = ocr.text,
                 labelTexts = labelTexts,
-                tags = tags,
                 processedAt = System.currentTimeMillis(),
+                classify = { _, _, width, height ->
+                    memeClassifier.classify(ocr, labels, width, height, bitmap)
+                },
+                describe = { ocrText -> captionEngine.caption(bitmap, labels, ocrText) },
+                tag = { ocrText, description ->
+                    tagExtractor.extract(labelTexts, ocrText, description)
+                },
+                embed = embeddingEngine::embed,
+                save = metadataRepository::saveCompleteRecord,
             )
-
-            // Embed-then-save tail (AC5): a throw here skips the write, so the
-            // photo stays not done; the repo transaction lands metadata +
-            // embedding + FTS together on success.
-            return RecordAssembler.complete(assembled.metadata.description, embeddingEngine::embed) { vector ->
-                metadataRepository.saveCompleteRecord(assembled.metadata, vector)
-            }
         } finally {
             if (bitmap?.isRecycled == false) bitmap.recycle()
         }

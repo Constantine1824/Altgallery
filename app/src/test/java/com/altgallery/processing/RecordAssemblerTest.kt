@@ -90,6 +90,26 @@ class RecordAssemblerTest {
         assertEquals(assembled.metadata.tags, assembled.fts.tags)
     }
 
+    @Test
+    fun `ftsFor is the single derivation point used by assemble`() {
+        val assembled = RecordAssembler.assemble(
+            contentUri = "content://media/external/images/media/7",
+            displayName = "IMG_2041.jpg",
+            dateTaken = 1L,
+            width = 10,
+            height = 10,
+            mimeType = "image/jpeg",
+            isMeme = false,
+            description = "a photo of cat",
+            ocrText = "hello",
+            labelTexts = listOf("Cat"),
+            tags = listOf("cat", "photo"),
+            processedAt = 2L,
+        )
+
+        assertEquals(RecordAssembler.ftsFor(assembled.metadata), assembled.fts)
+    }
+
     // AC3: per-photo isolation — no leakage between records.
 
     @Test
