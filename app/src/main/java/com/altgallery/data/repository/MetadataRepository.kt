@@ -8,11 +8,14 @@ import com.altgallery.data.db.toByteArray
 import com.altgallery.data.model.ImageEmbedding
 import com.altgallery.data.model.ImageMetadata
 import com.altgallery.data.model.ImageMetadataFts
+import com.altgallery.data.model.MediaImage
+import com.altgallery.processing.IndexPolicy
+import kotlinx.coroutines.flow.Flow
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Persists fully-processed photo records.
+ * Persists fully-processed photo records and defines "already processed".
  *
  * The pipeline core (INDX-001) builds an [ImageMetadata], its embedding vector,
  * and its FTS row in memory (see `RecordAssembler`, the single FTS derivation
@@ -22,9 +25,13 @@ import javax.inject.Singleton
  * persisted as given, not re-derived, so the copy the tests pin is the copy
  * that ships.
  *
- * Re-processing the same content URI is idempotent: stale embedding + FTS rows
- * for that URI are removed inside the same transaction before the fresh rows
- * are written.
+ * Done ([IndexPolicy]) means the FULL record landed (metadata + linked
+ * embedding row + FTS row) AND the stored dims/capture date still match the
+ * library. A half-written record (killed mid-run) is not done and stays
+ * eligible; an edited/replaced photo (dims/date drifted) becomes pending
+ * again. Re-processing the same content URI is idempotent: stale embedding +
+ * FTS rows for that URI are removed inside the same transaction before the
+ * fresh rows are written, so a photo is still counted exactly once.
  */
 @Singleton
 class MetadataRepository @Inject constructor(
@@ -67,7 +74,61 @@ class MetadataRepository @Inject constructor(
 
     suspend fun getByUri(uri: String): ImageMetadata? = metadataDao.getByUri(uri)
 
+    /** URI presence only (includes partial rows). Prefer [getCompleteUris] / [findPending] for the definition of done. */
     suspend fun getAllProcessedUris(): List<String> = metadataDao.getAllProcessedUris()
+
+    /** URIs whose full record landed (definition of done). */
+    suspend fun getCompleteUris(): List<String> = metadataDao.getCompleteUris()
+
+    /** One-shot indexed count for the home screen: complete records only. */
+    suspend fun getIndexedCount(): Int = metadataDao.getIndexedCount()
+
+    /** Home screen's indexed count: complete records only, stable across re-runs. */
+    fun observeIndexedCount(): Flow<Int> = metadataDao.observeCount()
+
+    /**
+     * True only when the photo's full record landed AND matches [image].
+     * Missing metadata, missing embedding/FTS rows, null/blank linkage, or
+     * drifted dims/capture date all mean "not done".
+     */
+    suspend fun isDone(image: MediaImage): Boolean {
+        val metadata = metadataDao.getByUri(image.uriString) ?: return false
+        if (!IndexPolicy.isComplete(
+                metadata,
+                hasEmbedding = embeddingDao.getByUri(image.uriString) != null,
+                hasFts = metadataDao.getFtsByUri(image.uriString) != null,
+            )
+        ) return false
+        return IndexPolicy.isFresh(metadata, image.width, image.height, image.dateTaken)
+    }
+
+    /**
+     * Pending subset of [images] in input order: not-done photos (missing or
+     * partial records) plus complete records whose dims/date drifted
+     * (edited/replaced on device). An unchanged re-run returns empty, so the
+     * second pass does no work and the indexed count cannot move.
+     */
+    suspend fun findPending(images: List<MediaImage>): List<MediaImage> {
+        if (images.isEmpty()) return emptyList()
+        val metadataByUri = metadataDao.getAll().associateBy { it.contentUri }
+        val embeddingUris = embeddingDao.getAllUris().toSet()
+        val ftsUris = metadataDao.getFtsUris().toSet()
+        val library = images.map {
+            IndexPolicy.LibraryPhoto(it.uriString, it.width, it.height, it.dateTaken)
+        }
+        val storedByUri = library.associate { photo ->
+            val metadata = metadataByUri[photo.contentUri]
+            photo.contentUri to IndexPolicy.StoredState(
+                metadata = metadata,
+                hasEmbedding = photo.contentUri in embeddingUris,
+                hasFts = photo.contentUri in ftsUris,
+            )
+        }
+        val pendingUris = IndexPolicy.findPending(library, storedByUri)
+            .map { it.contentUri }
+            .toSet()
+        return images.filter { it.uriString in pendingUris }
+    }
 
     suspend fun searchLike(term: String): List<ImageMetadata> = metadataDao.searchLike(term)
 

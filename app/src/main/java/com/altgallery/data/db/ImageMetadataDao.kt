@@ -25,6 +25,9 @@ interface ImageMetadataDao {
     suspend fun deleteFtsByUri(uri: String)
 
     @Query("SELECT * FROM image_metadata ORDER BY dateTaken DESC")
+    suspend fun getAll(): List<ImageMetadata>
+
+    @Query("SELECT * FROM image_metadata ORDER BY dateTaken DESC")
     fun observeAll(): Flow<List<ImageMetadata>>
 
     @Query("SELECT * FROM image_metadata WHERE contentUri = :uri")
@@ -36,8 +39,55 @@ interface ImageMetadataDao {
     @Query("SELECT contentUri FROM image_metadata")
     suspend fun getAllProcessedUris(): List<String>
 
-    @Query("SELECT COUNT(*) FROM image_metadata")
+    @Query("SELECT contentUri FROM image_metadata_fts")
+    suspend fun getFtsUris(): List<String>
+
+    @Query("SELECT * FROM image_metadata_fts WHERE contentUri = :uri")
+    suspend fun getFtsByUri(uri: String): ImageMetadataFts?
+
+    /**
+     * URIs whose FULL record landed: metadata with a linked embedding plus
+     * live embedding and FTS rows. This is the definition of done (see
+     * `IndexPolicy.isComplete`); partial rows from an interrupted run are
+     * excluded so they stay eligible and are never counted.
+     */
+    @Query(
+        """
+        SELECT m.contentUri FROM image_metadata AS m
+        WHERE m.embeddingId IS NOT NULL
+          AND TRIM(m.description) != ''
+          AND EXISTS (SELECT 1 FROM image_embeddings AS e WHERE e.contentUri = m.contentUri)
+          AND EXISTS (SELECT 1 FROM image_metadata_fts AS f WHERE f.contentUri = m.contentUri)
+        """
+    )
+    suspend fun getCompleteUris(): List<String>
+
+    /**
+     * Home screen indexed count: complete records only. A second run over an
+     * unchanged library writes nothing new, so this is stable across runs,
+     * and half-written rows never inflate it.
+     */
+    @Query(
+        """
+        SELECT COUNT(*) FROM image_metadata AS m
+        WHERE m.embeddingId IS NOT NULL
+          AND TRIM(m.description) != ''
+          AND EXISTS (SELECT 1 FROM image_embeddings AS e WHERE e.contentUri = m.contentUri)
+          AND EXISTS (SELECT 1 FROM image_metadata_fts AS f WHERE f.contentUri = m.contentUri)
+        """
+    )
     fun observeCount(): Flow<Int>
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM image_metadata AS m
+        WHERE m.embeddingId IS NOT NULL
+          AND TRIM(m.description) != ''
+          AND EXISTS (SELECT 1 FROM image_embeddings AS e WHERE e.contentUri = m.contentUri)
+          AND EXISTS (SELECT 1 FROM image_metadata_fts AS f WHERE f.contentUri = m.contentUri)
+        """
+    )
+    suspend fun getIndexedCount(): Int
 
     @Query("SELECT COUNT(*) FROM image_metadata WHERE isMeme = 1")
     fun observeMemeCount(): Flow<Int>

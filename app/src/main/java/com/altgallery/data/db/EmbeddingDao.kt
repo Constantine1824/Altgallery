@@ -18,6 +18,9 @@ interface EmbeddingDao {
     @Query("SELECT * FROM image_embeddings WHERE contentUri = :uri")
     suspend fun getByUri(uri: String): ImageEmbedding?
 
+    @Query("SELECT contentUri FROM image_embeddings")
+    suspend fun getAllUris(): List<String>
+
     @Query("SELECT COUNT(*) FROM image_embeddings")
     suspend fun count(): Int
 

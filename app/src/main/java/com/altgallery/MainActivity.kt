@@ -19,7 +19,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.altgallery.data.db.ImageMetadataDao
+import com.altgallery.data.repository.MetadataRepository
 import com.altgallery.ui.theme.AltGalleryTheme
 import dagger.hilt.android.AndroidEntryPoint
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -47,9 +47,9 @@ class MainActivity : ComponentActivity() {
 // Replaced by the real HomeScreen in M7.
 @HiltViewModel
 class PlaceholderViewModel @Inject constructor(
-    metadataDao: ImageMetadataDao,
+    metadataRepository: MetadataRepository,
 ) : ViewModel() {
-    val indexedCount = metadataDao.observeCount()
+    val indexedCount = metadataRepository.observeIndexedCount()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
 }
 

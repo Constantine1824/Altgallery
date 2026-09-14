@@ -68,8 +68,12 @@ class MediaRepository @Inject constructor(
     }
 
     /**
-     * Images present in MediaStore but not in [alreadyProcessed]. The pipeline
-     * (M4) uses this to skip work it has already done.
+     * Images present in MediaStore but not in [alreadyProcessed] (URI presence only).
+     *
+     * Prefer [MetadataRepository.findPending] for the definition of done: it also
+     * treats partial records as pending and re-queues edited photos whose
+     * dims/capture date drifted. This helper remains for callers that already
+     * hold a URI set.
      */
     suspend fun queryUnprocessed(alreadyProcessed: Set<String>): List<MediaImage> =
         queryAllImages().filter { it.uriString !in alreadyProcessed }
