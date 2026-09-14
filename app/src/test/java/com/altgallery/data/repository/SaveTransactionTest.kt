@@ -75,11 +75,16 @@ class SaveTransactionTest {
             metadata.forEach { upsert(it) }
         }
 
+        // Suppressions: the test double must implement the raw methods the
+        // DAO's own replaceFts is built on; production Kotlin callers are
+        // compile-barred from touching them directly.
+        @Suppress("DEPRECATION_ERROR")
         override suspend fun upsertFts(fts: ImageMetadataFts) {
             calls += "upsertFts:${fts.contentUri}"
             ftsRows += fts
         }
 
+        @Suppress("DEPRECATION_ERROR")
         override suspend fun deleteFtsByUri(uri: String) {
             calls += "deleteFts:$uri"
             ftsRows.removeAll { it.contentUri == uri }

@@ -20,27 +20,34 @@ interface ImageMetadataDao {
     suspend fun upsertAll(metadata: List<ImageMetadata>)
 
     /**
-     * Raw FTS insert. Do NOT call directly: the FTS table is virtual and
-     * carries no unique constraint, so REPLACE cannot deduplicate and every
-     * bare call appends a duplicate row. Use [replaceFts], which owns the
-     * delete-then-insert. This method stays visible only because Room must
-     * implement it for [replaceFts].
+     * Raw FTS insert. Compile-time forbidden except via [replaceFts]: the FTS
+     * table is virtual and carries no unique constraint, so REPLACE cannot
+     * deduplicate and every bare call appends a duplicate row. ERROR-level
+     * deprecation (not just docs) is the enforcement Room's schema leaves us.
      */
+    @Deprecated(
+        "Call replaceFts: bare FTS inserts duplicate rows (no unique constraint).",
+        level = DeprecationLevel.ERROR,
+    )
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertFts(fts: ImageMetadataFts)
 
     /**
-     * Raw FTS delete. Do NOT call directly outside [replaceFts]; a delete
-     * without the paired insert strands the record text-unfindable.
+     * Raw FTS delete. Compile-time forbidden except via [replaceFts]; a lone
+     * delete strands the record text-unfindable.
      */
+    @Deprecated(
+        "Call replaceFts: a lone delete strands the FTS row.",
+        level = DeprecationLevel.ERROR,
+    )
     @Query("DELETE FROM image_metadata_fts WHERE contentUri = :uri")
     suspend fun deleteFtsByUri(uri: String)
 
     /**
-     * DAO-owned FTS replace. The FTS table has no unique constraint, so a bare
-     * REPLACE insert would duplicate rows; delete-then-insert inside one
-     * transaction keeps exactly one FTS row per URI no matter the caller.
+     * The only legal FTS write path: delete-then-insert inside one
+     * transaction, exactly one row per URI for any caller.
      */
+    @Suppress("DEPRECATION_ERROR")
     @Transaction
     suspend fun replaceFts(fts: ImageMetadataFts) {
         deleteFtsByUri(fts.contentUri)
