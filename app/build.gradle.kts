@@ -95,4 +95,7 @@ dependencies {
 
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
+
+    // Unit tests (plain JVM: pure pipeline decisions, no device needed)
+    testImplementation(libs.junit)
 }

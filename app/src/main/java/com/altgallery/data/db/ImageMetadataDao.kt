@@ -21,6 +21,9 @@ interface ImageMetadataDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertFts(fts: ImageMetadataFts)
 
+    @Query("DELETE FROM image_metadata_fts WHERE contentUri = :uri")
+    suspend fun deleteFtsByUri(uri: String)
+
     @Query("SELECT * FROM image_metadata ORDER BY dateTaken DESC")
     fun observeAll(): Flow<List<ImageMetadata>>
 
@@ -65,4 +68,7 @@ interface ImageMetadataDao {
 
     @Query("DELETE FROM image_metadata")
     suspend fun clear()
+
+    @Query("DELETE FROM image_metadata_fts")
+    suspend fun clearFts()
 }
