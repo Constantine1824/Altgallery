@@ -14,7 +14,8 @@ import javax.inject.Singleton
  * 1. Lists the library ([MediaRepository.queryAllImages]).
  * 2. Keeps only pending photos ([MetadataRepository.findPending]): missing or
  *    partial records (killed mid-run) plus edited/replaced photos whose
- *    dims/capture date drifted. Unchanged, fully-recorded photos are skipped,
+ *    dims/capture date drifted or whose file was modified after indexing.
+ *    Unchanged, fully-recorded photos are skipped,
  *    so a second run over the same library does no work and the indexed count
  *    cannot move.
  * 3. Processes each pending photo via [ImageProcessor.process], which persists
@@ -23,6 +24,10 @@ import javax.inject.Singleton
  *
  * Reprocessing overwrites in one transaction, so recovered or edited photos
  * still leave exactly one record per URI.
+ *
+ * Note: no production caller invokes [runOnce] yet; the batch/WorkManager
+ * wiring that will own scheduling lives in M4. Until then the pipeline is
+ * exercised by unit tests only.
  */
 @Singleton
 class IndexingPipeline @Inject constructor(

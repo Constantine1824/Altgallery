@@ -15,6 +15,7 @@ data class MediaImage(
     val width: Int,
     val height: Int,
     val mimeType: String,         // image/jpeg, image/png, ...
+    val dateModified: Long = 0L,  // file mtime, epoch millis (0 = unknown)
 ) {
     val uriString: String get() = contentUri.toString()
 }

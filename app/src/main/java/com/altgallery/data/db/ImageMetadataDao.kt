@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Upsert
 import com.altgallery.data.model.ImageMetadata
 import com.altgallery.data.model.ImageMetadataFts
@@ -23,6 +24,17 @@ interface ImageMetadataDao {
 
     @Query("DELETE FROM image_metadata_fts WHERE contentUri = :uri")
     suspend fun deleteFtsByUri(uri: String)
+
+    /**
+     * DAO-owned FTS replace. The FTS table has no unique constraint, so a bare
+     * REPLACE insert would duplicate rows; delete-then-insert inside one
+     * transaction keeps exactly one FTS row per URI no matter the caller.
+     */
+    @Transaction
+    suspend fun replaceFts(fts: ImageMetadataFts) {
+        deleteFtsByUri(fts.contentUri)
+        upsertFts(fts)
+    }
 
     @Query("SELECT * FROM image_metadata ORDER BY dateTaken DESC")
     suspend fun getAll(): List<ImageMetadata>

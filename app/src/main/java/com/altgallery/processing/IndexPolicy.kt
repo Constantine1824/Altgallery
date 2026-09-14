@@ -20,7 +20,10 @@ import com.altgallery.data.model.ImageMetadata
  *
  * Freshness is separate from completeness: a complete record whose library
  * content changed (edited/replaced photo) is pending again. The signals are
- * dimensions and capture date. Library dims of 0 mean "unknown" (MediaStore
+ * dimensions, capture date, and file modification time: an in-place edit that
+ * preserves dims/dateTaken still bumps DATE_MODIFIED past [ImageMetadata.processedAt],
+ * so comparing mtime against the last index time catches the most common kind
+ * of edit. Library dims of 0 and an mtime of 0 mean "unknown" (MediaStore
  * gap) and never count as a change, otherwise a bitmap-fallback record would
  * look stale forever.
  */
@@ -29,13 +32,14 @@ object IndexPolicy {
     /**
      * Minimal snapshot of one library photo, Android-free so it runs on the
      * plain JVM. Map from [com.altgallery.data.model.MediaImage] via its
-     * uriString/width/height/dateTaken fields.
+     * uriString/width/height/dateTaken/dateModified fields.
      */
     data class LibraryPhoto(
         val contentUri: String,
         val width: Int,
         val height: Int,
         val dateTaken: Long,
+        val dateModified: Long = 0L,
     )
 
     /**
@@ -65,23 +69,25 @@ object IndexPolicy {
 
     /**
      * True when the stored record reflects the current library content.
-     * Unknown library dims (<= 0) are ignored so bitmap-fallback records
-     * don't flap.
+     * Unknown library dims (<= 0) and unknown mtime (<= 0) are ignored so
+     * bitmap-fallback records don't flap.
      */
     fun isFresh(
         metadata: ImageMetadata,
         imageWidth: Int,
         imageHeight: Int,
         imageDateTaken: Long,
+        imageDateModified: Long = 0L,
     ): Boolean {
         if (imageWidth > 0 && metadata.width != imageWidth) return false
         if (imageHeight > 0 && metadata.height != imageHeight) return false
         if (metadata.dateTaken != imageDateTaken) return false
+        if (imageDateModified > 0 && imageDateModified > metadata.processedAt) return false
         return true
     }
 
     fun isFresh(metadata: ImageMetadata, photo: LibraryPhoto): Boolean =
-        isFresh(metadata, photo.width, photo.height, photo.dateTaken)
+        isFresh(metadata, photo.width, photo.height, photo.dateTaken, photo.dateModified)
 
     /** A photo is done only when complete AND fresh. */
     fun isDone(photo: LibraryPhoto, stored: StoredState): Boolean {
@@ -91,7 +97,8 @@ object IndexPolicy {
 
     /**
      * Pending subset of [library] in library order: missing/incomplete rows,
-     * plus complete rows whose dims/date drifted (edited or replaced photo).
+     * plus complete rows whose dims/date drifted or whose mtime postdates the
+     * last index (edited or replaced photo).
      */
     fun findPending(
         library: List<LibraryPhoto>,

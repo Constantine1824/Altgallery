@@ -27,8 +27,9 @@ import javax.inject.Singleton
  *
  * Done ([IndexPolicy]) means the FULL record landed (metadata + linked
  * embedding row + FTS row) AND the stored dims/capture date still match the
- * library. A half-written record (killed mid-run) is not done and stays
- * eligible; an edited/replaced photo (dims/date drifted) becomes pending
+ * library with no newer file modification. A half-written record (killed
+ * mid-run) is not done and stays eligible; an edited/replaced photo
+ * (dims/date drifted, or mtime newer than the last index) becomes pending
  * again. Re-processing the same content URI is idempotent: stale embedding +
  * FTS rows for that URI are removed inside the same transaction before the
  * fresh rows are written, so a photo is still counted exactly once.
@@ -41,6 +42,13 @@ class MetadataRepository @Inject constructor(
 ) {
     /**
      * Atomically writes one complete indexed record.
+     *
+     * All four writes run inside a single Room transaction ([performSave]):
+     * stale embedding deleted, fresh embedding inserted, metadata upserted
+     * with the new embedding id, FTS row replaced via
+     * [ImageMetadataDao.replaceFts]. Either the whole record lands or a throw
+     * aborts before any later write, so a killed run can only leave a partial
+     * record that [findPending]/[isDone] still treat as not done.
      *
      * @param metadata record without [ImageMetadata.embeddingId] (resolved here).
      * @param fts the caller-built search row for [metadata] (see
@@ -57,20 +65,22 @@ class MetadataRepository @Inject constructor(
             "metadata and FTS rows must share the content URI"
         }
         val embeddingId = db.withTransaction {
-            embeddingDao.deleteByUri(metadata.contentUri)
-            metadataDao.deleteFtsByUri(metadata.contentUri)
-            val id = embeddingDao.insert(
-                ImageEmbedding(
-                    contentUri = metadata.contentUri,
-                    vector = vector.toByteArray(),
-                ),
-            )
-            metadataDao.upsert(metadata.copy(embeddingId = id))
-            metadataDao.upsertFts(fts)
-            id
+            performSave(metadata, fts, vector)
         }
         return metadata.copy(embeddingId = embeddingId)
     }
+
+    /**
+     * The write sequence behind [saveCompleteRecord], extracted so the order
+     * and throw-skips-later-writes contract is pinned by JVM tests with fake
+     * DAOs (see `SaveTransactionTest`). Production always invokes it inside
+     * [db.withTransaction]; the SQLite atomicity itself is Room's guarantee.
+     */
+    internal suspend fun performSave(
+        metadata: ImageMetadata,
+        fts: ImageMetadataFts,
+        vector: FloatArray,
+    ): Long = saveRecordSteps(metadataDao, embeddingDao, metadata, fts, vector)
 
     suspend fun getByUri(uri: String): ImageMetadata? = metadataDao.getByUri(uri)
 
@@ -89,7 +99,9 @@ class MetadataRepository @Inject constructor(
     /**
      * True only when the photo's full record landed AND matches [image].
      * Missing metadata, missing embedding/FTS rows, null/blank linkage, or
-     * drifted dims/capture date all mean "not done".
+     * drifted dims/capture date all mean "not done". A file modification newer
+     * than the last index time also means "not done" (in-place edit that kept
+     * dims and capture date).
      */
     suspend fun isDone(image: MediaImage): Boolean {
         val metadata = metadataDao.getByUri(image.uriString) ?: return false
@@ -99,14 +111,21 @@ class MetadataRepository @Inject constructor(
                 hasFts = metadataDao.getFtsByUri(image.uriString) != null,
             )
         ) return false
-        return IndexPolicy.isFresh(metadata, image.width, image.height, image.dateTaken)
+        return IndexPolicy.isFresh(
+            metadata,
+            image.width,
+            image.height,
+            image.dateTaken,
+            image.dateModified,
+        )
     }
 
     /**
      * Pending subset of [images] in input order: not-done photos (missing or
-     * partial records) plus complete records whose dims/date drifted
-     * (edited/replaced on device). An unchanged re-run returns empty, so the
-     * second pass does no work and the indexed count cannot move.
+     * partial records) plus complete records whose dims/date drifted or whose
+     * file was modified after indexing (edited/replaced on device). An
+     * unchanged re-run returns empty, so the second pass does no work and the
+     * indexed count cannot move.
      */
     suspend fun findPending(images: List<MediaImage>): List<MediaImage> {
         if (images.isEmpty()) return emptyList()
@@ -114,7 +133,7 @@ class MetadataRepository @Inject constructor(
         val embeddingUris = embeddingDao.getAllUris().toSet()
         val ftsUris = metadataDao.getFtsUris().toSet()
         val library = images.map {
-            IndexPolicy.LibraryPhoto(it.uriString, it.width, it.height, it.dateTaken)
+            IndexPolicy.LibraryPhoto(it.uriString, it.width, it.height, it.dateTaken, it.dateModified)
         }
         val storedByUri = library.associate { photo ->
             val metadata = metadataByUri[photo.contentUri]
@@ -133,4 +152,29 @@ class MetadataRepository @Inject constructor(
     suspend fun searchLike(term: String): List<ImageMetadata> = metadataDao.searchLike(term)
 
     suspend fun searchFts(query: String): List<ImageMetadata> = metadataDao.searchFts(query)
+}
+
+/**
+ * Ordered write sequence for one complete record: delete the stale embedding,
+ * insert the fresh one, upsert metadata with the new embedding id, replace
+ * the FTS row. A throw aborts before any later write. Top-level (instead of a
+ * method) so JVM tests can drive it with fake DAOs and no database.
+ */
+internal suspend fun saveRecordSteps(
+    metadataDao: ImageMetadataDao,
+    embeddingDao: EmbeddingDao,
+    metadata: ImageMetadata,
+    fts: ImageMetadataFts,
+    vector: FloatArray,
+): Long {
+    embeddingDao.deleteByUri(metadata.contentUri)
+    val id = embeddingDao.insert(
+        ImageEmbedding(
+            contentUri = metadata.contentUri,
+            vector = vector.toByteArray(),
+        ),
+    )
+    metadataDao.upsert(metadata.copy(embeddingId = id))
+    metadataDao.replaceFts(fts)
+    return id
 }

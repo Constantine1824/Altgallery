@@ -31,6 +31,7 @@ class MediaRepository @Inject constructor(
             MediaStore.Images.Media.DISPLAY_NAME,
             MediaStore.Images.Media.DATE_TAKEN,
             MediaStore.Images.Media.DATE_ADDED,
+            MediaStore.Images.Media.DATE_MODIFIED,
             MediaStore.Images.Media.WIDTH,
             MediaStore.Images.Media.HEIGHT,
             MediaStore.Images.Media.MIME_TYPE,
@@ -43,6 +44,7 @@ class MediaRepository @Inject constructor(
             val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
             val takenCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
             val addedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+            val modifiedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
             val widthCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
             val heightCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
             val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE)
@@ -54,6 +56,11 @@ class MediaRepository @Inject constructor(
                 val dateTaken = cursor.getLong(takenCol)
                     .takeIf { it > 0 }
                     ?: (cursor.getLong(addedCol) * 1000L)
+                // DATE_MODIFIED is seconds; 0/absent means unknown (never stale).
+                val dateModified = cursor.getLong(modifiedCol)
+                    .takeIf { it > 0 }
+                    ?.let { it * 1000L }
+                    ?: 0L
                 out += MediaImage(
                     contentUri = uri,
                     displayName = cursor.getString(nameCol) ?: "image_$id",
@@ -61,6 +68,7 @@ class MediaRepository @Inject constructor(
                     width = cursor.getInt(widthCol),
                     height = cursor.getInt(heightCol),
                     mimeType = cursor.getString(mimeCol) ?: "image/*",
+                    dateModified = dateModified,
                 )
             }
         }

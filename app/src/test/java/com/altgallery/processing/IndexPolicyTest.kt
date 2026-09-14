@@ -47,7 +47,8 @@ class IndexPolicyTest {
         width: Int = 800,
         height: Int = 600,
         dateTaken: Long = 1000L,
-    ) = IndexPolicy.LibraryPhoto(uri, width, height, dateTaken)
+        dateModified: Long = 0L,
+    ) = IndexPolicy.LibraryPhoto(uri, width, height, dateTaken, dateModified)
 
     private fun stored(
         meta: ImageMetadata? = metadata(),
@@ -192,5 +193,28 @@ class IndexPolicyTest {
         assertEquals(1024, refreshed.metadata!!.width)
         assertEquals(768, refreshed.metadata!!.height)
         assertEquals(5000L, refreshed.metadata!!.dateTaken)
+    }
+
+    // In-place edits that preserve dims/dateTaken still bump mtime past
+    // processedAt (stored fixture uses processedAt = 2000).
+
+    @Test
+    fun `mtime newer than last index requeues`() {
+        val base = stored()
+        assertFalse(IndexPolicy.isDone(photo(dateModified = 2001L), base))
+        assertFalse(IndexPolicy.isDone(photo(dateModified = 9999L), base))
+    }
+
+    @Test
+    fun `mtime at or before last index stays done`() {
+        val base = stored()
+        assertTrue(IndexPolicy.isDone(photo(dateModified = 2000L), base))
+        assertTrue(IndexPolicy.isDone(photo(dateModified = 1000L), base))
+    }
+
+    @Test
+    fun `unknown mtime never counts as a change`() {
+        val base = stored()
+        assertTrue(IndexPolicy.isDone(photo(dateModified = 0L), base))
     }
 }
