@@ -2,6 +2,7 @@ package com.altgallery.processing
 
 import com.altgallery.data.model.ImageMetadata
 import com.altgallery.data.model.MediaImage
+import com.altgallery.data.repository.MediaRepository
 import com.altgallery.data.repository.MetadataRepository
 import com.altgallery.ml.BitmapLoader
 import com.altgallery.ml.CaptionEngine
@@ -26,6 +27,13 @@ import javax.inject.Singleton
  * captioning, or embedding throws, the exception propagates and no partial row
  * is written — the photo is simply not marked done. Batching, skip-sets, and
  * failure policies build on top of this and live outside it.
+ *
+ * Stamp-timing race: an edit that lands while the slow stages run would leave
+ * a record the mtime freshness check can never flag (the edit predates the
+ * write). [process] therefore snapshots the library row at intake and
+ * re-reads it after the stages; on any move it throws
+ * [StaleSnapshotException] before saving, so the photo stays pending and the
+ * next run indexes the new bytes. A vanished row throws [PhotoGoneException].
  */
 @Singleton
 class ImageProcessor @Inject constructor(
@@ -37,21 +45,46 @@ class ImageProcessor @Inject constructor(
     private val tagExtractor: TagExtractor,
     private val embeddingEngine: EmbeddingEngine,
     private val metadataRepository: MetadataRepository,
+    private val mediaRepository: MediaRepository,
 ) {
     /**
      * Runs the full per-photo pipeline and persists the complete record.
      *
      * @return the persisted [ImageMetadata] with [ImageMetadata.embeddingId] set.
-     * @throws Exception if any stage fails; nothing is written in that case.
+     * @throws Exception if any stage fails, the row moves mid-run
+     * ([StaleSnapshotException]), or the photo vanishes ([PhotoGoneException]);
+     * nothing is written in all cases.
      */
     suspend fun process(image: MediaImage): ImageMetadata {
         val uri = image.contentUri
+        val before = IndexPolicy.LibraryPhoto(
+            contentUri = image.uriString,
+            width = image.width,
+            height = image.height,
+            dateTaken = image.dateTaken,
+            dateModified = image.dateModified,
+        )
         val bitmap = bitmapLoader.load(uri)
         try {
             // ML stages first — all must succeed before anything is recorded.
             val ocr = ocrEngine.recognize(uri)
             val labels = labelEngine.label(uri)
             val labelTexts = labels.map { it.text }
+
+            // Stale-snapshot guard: re-read after the slow stages, before the
+            // save. An edit inside our own window discards the result.
+            val current = mediaRepository.queryByUri(image.uriString)
+                ?: throw PhotoGoneException(image.uriString)
+            val after = IndexPolicy.LibraryPhoto(
+                contentUri = current.uriString,
+                width = current.width,
+                height = current.height,
+                dateTaken = current.dateTaken,
+                dateModified = current.dateModified,
+            )
+            if (IndexPolicy.snapshotChanged(before, after)) {
+                throw StaleSnapshotException(image.uriString)
+            }
 
             // Pure tail owns the wiring (normalize → effective dims → classify
             // → describe → tag → assemble → embed-then-save). Stage lambdas

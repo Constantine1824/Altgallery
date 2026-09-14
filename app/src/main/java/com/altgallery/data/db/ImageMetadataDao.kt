@@ -19,9 +19,20 @@ interface ImageMetadataDao {
     @Upsert
     suspend fun upsertAll(metadata: List<ImageMetadata>)
 
+    /**
+     * Raw FTS insert. Do NOT call directly: the FTS table is virtual and
+     * carries no unique constraint, so REPLACE cannot deduplicate and every
+     * bare call appends a duplicate row. Use [replaceFts], which owns the
+     * delete-then-insert. This method stays visible only because Room must
+     * implement it for [replaceFts].
+     */
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertFts(fts: ImageMetadataFts)
 
+    /**
+     * Raw FTS delete. Do NOT call directly outside [replaceFts]; a delete
+     * without the paired insert strands the record text-unfindable.
+     */
     @Query("DELETE FROM image_metadata_fts WHERE contentUri = :uri")
     suspend fun deleteFtsByUri(uri: String)
 
@@ -62,12 +73,17 @@ interface ImageMetadataDao {
      * live embedding and FTS rows. This is the definition of done (see
      * `IndexPolicy.isComplete`); partial rows from an interrupted run are
      * excluded so they stay eligible and are never counted.
+     *
+     * Blank-description guard mirrors `isBlank()`: SQLite TRIM strips spaces
+     * only, so the trim set covers tab/LF/VT/FF/CR explicitly, otherwise a
+     * tab-only corrupt row would count as done here while the policy treats
+     * it as not done.
      */
     @Query(
         """
         SELECT m.contentUri FROM image_metadata AS m
         WHERE m.embeddingId IS NOT NULL
-          AND TRIM(m.description) != ''
+          AND TRIM(m.description, ' ' || CHAR(9) || CHAR(10) || CHAR(11) || CHAR(12) || CHAR(13)) != ''
           AND EXISTS (SELECT 1 FROM image_embeddings AS e WHERE e.contentUri = m.contentUri)
           AND EXISTS (SELECT 1 FROM image_metadata_fts AS f WHERE f.contentUri = m.contentUri)
         """
@@ -83,7 +99,7 @@ interface ImageMetadataDao {
         """
         SELECT COUNT(*) FROM image_metadata AS m
         WHERE m.embeddingId IS NOT NULL
-          AND TRIM(m.description) != ''
+          AND TRIM(m.description, ' ' || CHAR(9) || CHAR(10) || CHAR(11) || CHAR(12) || CHAR(13)) != ''
           AND EXISTS (SELECT 1 FROM image_embeddings AS e WHERE e.contentUri = m.contentUri)
           AND EXISTS (SELECT 1 FROM image_metadata_fts AS f WHERE f.contentUri = m.contentUri)
         """
@@ -94,7 +110,7 @@ interface ImageMetadataDao {
         """
         SELECT COUNT(*) FROM image_metadata AS m
         WHERE m.embeddingId IS NOT NULL
-          AND TRIM(m.description) != ''
+          AND TRIM(m.description, ' ' || CHAR(9) || CHAR(10) || CHAR(11) || CHAR(12) || CHAR(13)) != ''
           AND EXISTS (SELECT 1 FROM image_embeddings AS e WHERE e.contentUri = m.contentUri)
           AND EXISTS (SELECT 1 FROM image_metadata_fts AS f WHERE f.contentUri = m.contentUri)
         """

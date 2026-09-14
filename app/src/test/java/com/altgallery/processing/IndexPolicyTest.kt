@@ -217,4 +217,31 @@ class IndexPolicyTest {
         val base = stored()
         assertTrue(IndexPolicy.isDone(photo(dateModified = 0L), base))
     }
+
+    // Stamp-timing race: snapshot moved between intake and post-stage re-read.
+
+    @Test
+    fun `identical snapshots are unchanged`() {
+        assertFalse(IndexPolicy.snapshotChanged(photo(), photo()))
+        assertFalse(
+            IndexPolicy.snapshotChanged(
+                photo(dateModified = 1500L),
+                photo(dateModified = 1500L),
+            ),
+        )
+    }
+
+    @Test
+    fun `any signal move is a change`() {
+        val before = photo()
+        assertTrue(IndexPolicy.snapshotChanged(before, photo(width = 1024)))
+        assertTrue(IndexPolicy.snapshotChanged(before, photo(height = 768)))
+        assertTrue(IndexPolicy.snapshotChanged(before, photo(dateTaken = 9999L)))
+        assertTrue(IndexPolicy.snapshotChanged(before, photo(dateModified = 1500L)))
+    }
+
+    @Test
+    fun `unknown to known mtime counts as changed`() {
+        assertTrue(IndexPolicy.snapshotChanged(photo(dateModified = 0L), photo(dateModified = 5000L)))
+    }
 }

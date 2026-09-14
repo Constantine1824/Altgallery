@@ -201,4 +201,17 @@ class SaveTransactionTest {
         )
         assertTrue(firstId != secondId)
     }
+
+    @Test
+    fun `replaceFts twice still leaves one row`() = runBlocking {
+        // Direct DAO-level pin for the no-unique-constraint trap: the blessed
+        // path deduplicates even when invoked repeatedly on its own.
+        val metas = FakeMetadataDao()
+        val fts = ftsFor(metadata())
+
+        metas.replaceFts(fts)
+        metas.replaceFts(fts)
+
+        assertEquals(1, metas.ftsRows.count { it.contentUri == fts.contentUri })
+    }
 }

@@ -3,6 +3,8 @@ package com.altgallery.data.repository
 import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.Context
+import android.database.Cursor
+import android.net.Uri
 import android.provider.MediaStore
 import com.altgallery.data.model.MediaImage
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -23,53 +25,34 @@ class MediaRepository @Inject constructor(
 ) {
     private val resolver: ContentResolver get() = context.contentResolver
 
+    /** Current library row for one URI, or null when gone, unparseable, or unreadable. */
+    suspend fun queryByUri(uriString: String): MediaImage? = withContext(Dispatchers.IO) {
+        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val id = try {
+            ContentUris.parseId(Uri.parse(uriString))
+        } catch (e: Exception) {
+            return@withContext null
+        }
+        resolver.query(
+            collection,
+            PROJECTION,
+            "${MediaStore.Images.Media._ID} = ?",
+            arrayOf(id.toString()),
+            null,
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.readImage(collection) else null
+        }
+    }
+
     /** Every image on the device, newest first. */
     suspend fun queryAllImages(): List<MediaImage> = withContext(Dispatchers.IO) {
         val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val projection = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DISPLAY_NAME,
-            MediaStore.Images.Media.DATE_TAKEN,
-            MediaStore.Images.Media.DATE_ADDED,
-            MediaStore.Images.Media.DATE_MODIFIED,
-            MediaStore.Images.Media.WIDTH,
-            MediaStore.Images.Media.HEIGHT,
-            MediaStore.Images.Media.MIME_TYPE,
-        )
         val sortOrder = "${MediaStore.Images.Media.DATE_TAKEN} DESC"
 
         val out = ArrayList<MediaImage>()
-        resolver.query(collection, projection, null, null, sortOrder)?.use { cursor ->
-            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
-            val takenCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
-            val addedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
-            val modifiedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
-            val widthCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
-            val heightCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
-            val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE)
-
+        resolver.query(collection, PROJECTION, null, null, sortOrder)?.use { cursor ->
             while (cursor.moveToNext()) {
-                val id = cursor.getLong(idCol)
-                val uri = ContentUris.withAppendedId(collection, id)
-                // DATE_TAKEN is millis and may be 0/absent; DATE_ADDED is seconds.
-                val dateTaken = cursor.getLong(takenCol)
-                    .takeIf { it > 0 }
-                    ?: (cursor.getLong(addedCol) * 1000L)
-                // DATE_MODIFIED is seconds; 0/absent means unknown (never stale).
-                val dateModified = cursor.getLong(modifiedCol)
-                    .takeIf { it > 0 }
-                    ?.let { it * 1000L }
-                    ?: 0L
-                out += MediaImage(
-                    contentUri = uri,
-                    displayName = cursor.getString(nameCol) ?: "image_$id",
-                    dateTaken = dateTaken,
-                    width = cursor.getInt(widthCol),
-                    height = cursor.getInt(heightCol),
-                    mimeType = cursor.getString(mimeCol) ?: "image/*",
-                    dateModified = dateModified,
-                )
+                out += cursor.readImage(collection)
             }
         }
         out
@@ -85,4 +68,43 @@ class MediaRepository @Inject constructor(
      */
     suspend fun queryUnprocessed(alreadyProcessed: Set<String>): List<MediaImage> =
         queryAllImages().filter { it.uriString !in alreadyProcessed }
+
+    companion object {
+        private val PROJECTION = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.DATE_TAKEN,
+            MediaStore.Images.Media.DATE_ADDED,
+            MediaStore.Images.Media.DATE_MODIFIED,
+            MediaStore.Images.Media.WIDTH,
+            MediaStore.Images.Media.HEIGHT,
+            MediaStore.Images.Media.MIME_TYPE,
+        )
+
+        private fun Cursor.readImage(collection: Uri): MediaImage {
+            val idCol = getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            val nameCol = getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+            val takenCol = getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
+            val addedCol = getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+            val modifiedCol = getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
+            val widthCol = getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
+            val heightCol = getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
+            val mimeCol = getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE)
+
+            val id = getLong(idCol)
+            // DATE_TAKEN is millis and may be 0/absent; DATE_ADDED is seconds.
+            val dateTaken = getLong(takenCol)
+                .takeIf { it > 0 }
+                ?: MediaImage.mediaStoreSecondsToMillis(getLong(addedCol))
+            return MediaImage(
+                contentUri = ContentUris.withAppendedId(collection, id),
+                displayName = getString(nameCol) ?: "image_$id",
+                dateTaken = dateTaken,
+                width = getInt(widthCol),
+                height = getInt(heightCol),
+                mimeType = getString(mimeCol) ?: "image/*",
+                dateModified = MediaImage.mediaStoreSecondsToMillis(getLong(modifiedCol)),
+            )
+        }
+    }
 }

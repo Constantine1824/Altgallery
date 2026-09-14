@@ -96,6 +96,22 @@ object IndexPolicy {
     }
 
     /**
+     * True when the library row moved between two reads of the same URI
+     * (width, height, capture date, or mtime differ). The pipeline snapshots
+     * [before] at intake and re-reads [after] once the slow ML stages finish;
+     * a move means an edit landed inside the photo's own processing window,
+     * where the mtime-vs-processedAt check could never flag it, so the run
+     * must discard the result and retry next time. Any unknown (0) side that
+     * disagrees counts as changed: at worst one extra reprocess to establish
+     * a baseline, then stable.
+     */
+    fun snapshotChanged(before: LibraryPhoto, after: LibraryPhoto): Boolean =
+        before.width != after.width ||
+            before.height != after.height ||
+            before.dateTaken != after.dateTaken ||
+            before.dateModified != after.dateModified
+
+    /**
      * Pending subset of [library] in library order: missing/incomplete rows,
      * plus complete rows whose dims/date drifted or whose mtime postdates the
      * last index (edited or replaced photo).
