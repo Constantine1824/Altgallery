@@ -4,12 +4,15 @@ import androidx.room.withTransaction
 import com.altgallery.data.db.AltGalleryDatabase
 import com.altgallery.data.db.EmbeddingDao
 import com.altgallery.data.db.ImageMetadataDao
+import com.altgallery.data.db.ProcessingFailureDao
 import com.altgallery.data.db.toByteArray
 import com.altgallery.data.model.ImageEmbedding
 import com.altgallery.data.model.ImageMetadata
 import com.altgallery.data.model.ImageMetadataFts
 import com.altgallery.data.model.MediaImage
+import com.altgallery.data.model.ProcessingFailure
 import com.altgallery.processing.IndexPolicy
+import com.altgallery.processing.PhotoFailure
 import kotlinx.coroutines.flow.Flow
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -39,6 +42,7 @@ class MetadataRepository @Inject constructor(
     private val db: AltGalleryDatabase,
     private val metadataDao: ImageMetadataDao,
     private val embeddingDao: EmbeddingDao,
+    private val failureDao: ProcessingFailureDao,
 ) {
     /**
      * Atomically writes one complete indexed record.
@@ -152,6 +156,28 @@ class MetadataRepository @Inject constructor(
     suspend fun searchLike(term: String): List<ImageMetadata> = metadataDao.searchLike(term)
 
     suspend fun searchFts(query: String): List<ImageMetadata> = metadataDao.searchFts(query)
+
+    /**
+     * Replaces the durable failure log with this run's failures (empty clears
+     * it after a clean run), in one transaction. A failed photo writes no
+     * index record, so it stays pending and is re-attempted with a fresh
+     * budget on the next run; the log is what keeps repeat offenders visible
+     * across runs instead of failing silently. A photo that recovers drops
+     * out of the log on the recovering run, and a deleted photo stops being
+     * re-recorded.
+     */
+    suspend fun recordRunFailures(failures: List<PhotoFailure>) {
+        val now = System.currentTimeMillis()
+        db.withTransaction {
+            replaceFailureSteps(failureDao, failures, now)
+        }
+    }
+
+    /** Last run's failure log, newest first. Empty when the last run was clean. */
+    suspend fun getRecordedFailures(): List<ProcessingFailure> = failureDao.getAll()
+
+    /** Observable failure log for the future on-screen failures view. */
+    fun observeRecordedFailures(): Flow<List<ProcessingFailure>> = failureDao.observeAll()
 }
 
 /**
@@ -177,4 +203,31 @@ internal suspend fun saveRecordSteps(
     metadataDao.upsert(metadata.copy(embeddingId = id))
     metadataDao.replaceFts(fts)
     return id
+}
+
+/**
+ * Ordered write sequence for one run's failure log: clear the previous run's
+ * rows, then insert this run's failures stamped with [failedAt]. A throw
+ * aborts before any later write. Top-level (instead of a method) so JVM tests
+ * can drive it with a fake DAO and no database.
+ */
+internal suspend fun replaceFailureSteps(
+    failureDao: ProcessingFailureDao,
+    failures: List<PhotoFailure>,
+    failedAt: Long,
+) {
+    failureDao.clear()
+    if (failures.isNotEmpty()) {
+        failureDao.upsertAll(
+            failures.map {
+                ProcessingFailure(
+                    contentUri = it.contentUri,
+                    displayName = it.displayName,
+                    reason = it.reason,
+                    attempts = it.attempts,
+                    failedAt = failedAt,
+                )
+            },
+        )
+    }
 }
