@@ -22,7 +22,9 @@ import java.util.concurrent.TimeUnit
  * replacement run picks back up via the already-processed definition. A run
  * over an unchanged library finds nothing pending and succeeds immediately.
  * Retries after a transient throw back off exponentially from
- * [RETRY_BACKOFF_SECONDS] so a flapping run does not hot-loop.
+ * [RETRY_BACKOFF_SECONDS] so a flapping run does not hot-loop, and give up
+ * after [MAX_RUN_ATTEMPTS] executions (see `actionForRunThrow`) instead of
+ * retrying forever — the next cold start then grants a fresh budget.
  *
  * Test scope: `WorkManager` needs a device, so the enqueue behavior is
  * verified on-device per the ticket's acceptance criteria.
