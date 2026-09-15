@@ -34,8 +34,12 @@ import javax.inject.Singleton
  * save step re-reads it immediately before the transaction — after caption
  * and embedding, the two slowest stages — throwing [StaleSnapshotException]
  * on any move, so the photo stays pending and the next run indexes the new
- * bytes. A vanished row throws [PhotoGoneException]. The residual window is
- * the transaction itself, which Room holds atomically.
+ * bytes. A vanished row throws [PhotoGoneException]. The leftover window
+ * between that re-read and the transaction commit is NOT closed by Room
+ * atomicity (the transaction covers only the database writes, never the
+ * MediaStore edit); it is caught on the next run by the second-aware mtime
+ * check ([IndexPolicy.isFresh]), since the edit's quantized mtime lands on or
+ * after the floored index second.
  */
 @Singleton
 class ImageProcessor @Inject constructor(
@@ -68,12 +72,13 @@ class ImageProcessor @Inject constructor(
             val labelTexts = labels.map { it.text }
 
             // Pure tail owns the wiring (normalize → effective dims → classify
-            // → describe → tag → assemble → embed-then-save). Stage lambdas
-            // close over the Android objects; the tail itself is JVM-testable
-            // (see RecordAssembler.processPhoto). The save step re-reads the
-            // row first (guardSnapshot): an edit anywhere in our own window —
-            // including inside caption/embed — discards the result before the
-            // transaction opens.
+            // → describe → tag → assemble → embed-then-guard-then-save). Stage
+            // lambdas close over the Android objects; the tail itself is
+            // JVM-testable (see RecordAssembler.processPhoto). The guard is a
+            // required tail argument, not a caller-side detail: the tail
+            // re-reads the row after embed — the slowest stage — so an edit
+            // anywhere in our own window, including inside caption/embed,
+            // discards the result before the transaction opens.
             return RecordAssembler.processPhoto(
                 contentUri = image.uriString,
                 displayName = image.displayName,
@@ -86,6 +91,10 @@ class ImageProcessor @Inject constructor(
                 ocrRaw = ocr.text,
                 labelTexts = labelTexts,
                 processedAt = System.currentTimeMillis(),
+                snapshotBefore = before,
+                snapshotRequery = {
+                    mediaRepository.queryByUri(image.uriString)?.let(::snapshotOf)
+                },
                 classify = { _, _, width, height ->
                     memeClassifier.classify(ocr, labels, width, height, bitmap)
                 },
@@ -94,12 +103,7 @@ class ImageProcessor @Inject constructor(
                     tagExtractor.extract(labelTexts, ocrText, description)
                 },
                 embed = embeddingEngine::embed,
-                save = { metadata, fts, vector ->
-                    guardSnapshot(before) {
-                        mediaRepository.queryByUri(image.uriString)?.let(::snapshotOf)
-                    }
-                    metadataRepository.saveCompleteRecord(metadata, fts, vector)
-                },
+                save = metadataRepository::saveCompleteRecord,
             )
         } finally {
             if (bitmap?.isRecycled == false) bitmap.recycle()
@@ -125,8 +129,11 @@ internal fun snapshotOf(image: MediaImage): IndexPolicy.LibraryPhoto =
     )
 
 /**
- * Stale-snapshot guard behind the save step, extracted so the wiring is
- * pinned by JVM tests with a fake requery (see `SnapshotGuardTest`):
+ * Stale-snapshot guard behind the save step, exercised two ways: directly
+ * with a fake requery (see `SnapshotGuardTest`), and structurally through
+ * the tail — [RecordAssembler.processPhoto] takes the snapshot pair as
+ * required arguments and runs this before `save`, so the `process()` wiring
+ * cannot drop or reorder it without failing `PipelineWiringTest`:
  * a vanished row throws [PhotoGoneException], a moved row throws
  * [StaleSnapshotException], an identical row passes silently.
  */

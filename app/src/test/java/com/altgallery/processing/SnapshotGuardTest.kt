@@ -6,11 +6,13 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 /**
- * Pins the stale-snapshot wiring the race fix lives in.
+ * Pins the stale-snapshot check itself.
  *
- * [guardSnapshot] is the exact check the save step runs after embed and
- * before the transaction opens (see `ImageProcessor.process`): a vanished
- * row throws [PhotoGoneException], a row that moved mid-run throws
+ * [guardSnapshot] is the exact check the tail runs after embed and before the
+ * transaction opens ([RecordAssembler.processPhoto] requires the snapshot
+ * pair, so `ImageProcessor.process` cannot bypass it — see
+ * `PipelineWiringTest` for the wiring pin): a vanished row throws
+ * [PhotoGoneException], a row that moved mid-run throws
  * [StaleSnapshotException] (nothing is written), an identical row passes
  * silently. The predicate itself ([IndexPolicy.snapshotChanged]) is pinned
  * separately in `IndexPolicyTest`.

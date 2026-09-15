@@ -27,7 +27,11 @@ import com.altgallery.data.model.ImageMetadataFts
  *   per-photo tail (normalize → resolve dims → classify → describe → tag →
  *   assemble → embed-then-save). `ImageProcessor.process` maps Android types
  *   to primitives and delegates here, so the wiring the dims bug lived in is
- *   pinned by tests.
+ *   pinned by tests. The stale-snapshot guard is a required argument of
+ *   `processPhoto` (not a caller-side lambda detail): the save step re-reads
+ *   via `snapshotRequery` and throws before any write on a move/vanish, so
+ *   the guard cannot be deleted or misplaced from `ImageProcessor.process`
+ *   without failing the tail tests.
  */
 data class AssembledRecord(
     val metadata: ImageMetadata,
@@ -139,6 +143,13 @@ object RecordAssembler {
      * FTS row are what reach [save] via [complete] (embed-then-save, so an
      * embed throw skips the write). Stage lambdas close over Android objects
      * in `ImageProcessor.process`, keeping this runnable on the plain JVM.
+     *
+     * The stale-snapshot guard is structural: `snapshotBefore` is the intake
+     * snapshot and `snapshotRequery` re-reads the row after embed (the slowest
+     * stage). Any move throws [StaleSnapshotException], a vanished row throws
+     * [PhotoGoneException], before `save` runs — so nothing is written and the
+     * photo stays pending. Callers cannot opt out: omitting the guard is a
+     * compile error, and moving it after `save` fails the ordering test.
      */
     @Suppress("LongParameterList")
     suspend fun processPhoto(
@@ -155,6 +166,8 @@ object RecordAssembler {
         clusterId: String = UNCLUSTERED,
         processedAt: Long,
         modelVersion: String = MODEL_VERSION,
+        snapshotBefore: IndexPolicy.LibraryPhoto,
+        snapshotRequery: suspend () -> IndexPolicy.LibraryPhoto?,
         classify: (ocrText: String?, labelTexts: List<String>, width: Int, height: Int) -> Boolean,
         describe: suspend (ocrText: String) -> String,
         tag: (ocrText: String, description: String) -> List<String>,
@@ -183,6 +196,7 @@ object RecordAssembler {
             modelVersion = modelVersion,
         )
         return complete(assembled.metadata.description, embed) { vector ->
+            guardSnapshot(snapshotBefore, snapshotRequery)
             save(assembled.metadata, assembled.fts, vector)
         }
     }

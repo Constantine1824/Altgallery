@@ -206,10 +206,38 @@ class IndexPolicyTest {
     }
 
     @Test
-    fun `mtime at or before last index stays done`() {
+    fun `same-second mtime counts as stale (second-quantized DATE_MODIFIED)`() {
+        // Stored fixture uses processedAt = 2000. DATE_MODIFIED arrives
+        // quantized to whole seconds while processedAt is millis-precise, so
+        // a bare `mtime > processedAt` would miss an edit landing in the same
+        // second after indexing. The check floors processedAt and treats
+        // equality as stale: at worst one extra reprocess, then stable.
         val base = stored()
-        assertTrue(IndexPolicy.isDone(photo(dateModified = 2000L), base))
+        assertFalse(IndexPolicy.isDone(photo(dateModified = 2000L), base))
+    }
+
+    @Test
+    fun `same-second edit after a mid-second index requeues`() {
+        // processedAt = 2500 floors to 2000; a quantized mtime of 2000 may be
+        // up to 999ms newer than the index yet compare equal as millis. Must
+        // still requeue — this is the ~1s dead zone the floor closes.
+        val base = stored(meta = metadata().copy(processedAt = 2500L))
+        assertFalse(IndexPolicy.isDone(photo(dateModified = 2000L), base))
+    }
+
+    @Test
+    fun `mtime in a strictly earlier second stays done`() {
+        val base = stored()
         assertTrue(IndexPolicy.isDone(photo(dateModified = 1000L), base))
+        assertTrue(IndexPolicy.isDone(photo(dateModified = 1999L), base))
+    }
+
+    @Test
+    fun `floorToSecond maps millis to MediaStore boundary`() {
+        assertEquals(0L, IndexPolicy.floorToSecond(0L))
+        assertEquals(2000L, IndexPolicy.floorToSecond(2000L))
+        assertEquals(2000L, IndexPolicy.floorToSecond(2500L))
+        assertEquals(2000L, IndexPolicy.floorToSecond(2999L))
     }
 
     @Test

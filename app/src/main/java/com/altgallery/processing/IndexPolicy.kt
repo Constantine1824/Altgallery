@@ -21,11 +21,24 @@ import com.altgallery.data.model.ImageMetadata
  * Freshness is separate from completeness: a complete record whose library
  * content changed (edited/replaced photo) is pending again. The signals are
  * dimensions, capture date, and file modification time: an in-place edit that
- * preserves dims/dateTaken still bumps DATE_MODIFIED past [ImageMetadata.processedAt],
- * so comparing mtime against the last index time catches the most common kind
+ * preserves dims/dateTaken still bumps DATE_MODIFIED past the last index, so
+ * comparing mtime against the last index time catches the most common kind
  * of edit. Library dims of 0 and an mtime of 0 mean "unknown" (MediaStore
  * gap) and never count as a change, otherwise a bitmap-fallback record would
  * look stale forever.
+ *
+ * Second-quantization note: MediaStore DATE_MODIFIED is whole seconds
+ * (see [com.altgallery.data.model.MediaImage.mediaStoreSecondsToMillis])
+ * while [ImageMetadata.processedAt] is millisecond-precise, so a bare
+ * `mtime > processedAt` misses edits that land in the same wall-clock second
+ * after indexing (up to ~1s dead zone). [isFresh] therefore compares the
+ * second-quantized mtime against the second-floored index time (`>=` on the
+ * floored boundary): a same-second mtime counts as stale. At worst that costs
+ * one extra reprocess for a photo modified in the very second it was indexed,
+ * then stable; edits can no longer hide inside the quantization step. The
+ * same quantization blinds [snapshotChanged] to same-second moves, which is
+ * why the save-step guard and this next-run check overlap rather than replace
+ * each other.
  */
 object IndexPolicy {
 
@@ -71,6 +84,12 @@ object IndexPolicy {
      * True when the stored record reflects the current library content.
      * Unknown library dims (<= 0) and unknown mtime (<= 0) are ignored so
      * bitmap-fallback records don't flap.
+     *
+     * The mtime arm is second-aware: [imageDateModified] arrives quantized to
+     * whole seconds while [ImageMetadata.processedAt] is millis-precise, so
+     * the comparison floors the index time to its second boundary and treats
+     * a same-second mtime as stale (`mtime >= floor(processedAt)`). A bare
+     * `mtime > processedAt` would leave a ~1s dead zone after every write.
      */
     fun isFresh(
         metadata: ImageMetadata,
@@ -82,9 +101,17 @@ object IndexPolicy {
         if (imageWidth > 0 && metadata.width != imageWidth) return false
         if (imageHeight > 0 && metadata.height != imageHeight) return false
         if (metadata.dateTaken != imageDateTaken) return false
-        if (imageDateModified > 0 && imageDateModified > metadata.processedAt) return false
+        if (imageDateModified > 0 && imageDateModified >= floorToSecond(metadata.processedAt)) return false
         return true
     }
+
+    /**
+     * Floors millisecond timestamps to their MediaStore second boundary so a
+     * second-quantized mtime can be compared without a dead zone. Non-positive
+     * input maps to 0 (unknown, never stale on its own).
+     */
+    internal fun floorToSecond(millis: Long): Long =
+        if (millis <= 0) 0L else (millis / 1000L) * 1000L
 
     fun isFresh(metadata: ImageMetadata, photo: LibraryPhoto): Boolean =
         isFresh(metadata, photo.width, photo.height, photo.dateTaken, photo.dateModified)
