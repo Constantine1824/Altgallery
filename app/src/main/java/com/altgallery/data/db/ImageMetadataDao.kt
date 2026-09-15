@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Upsert
 import com.altgallery.data.model.ImageMetadata
 import com.altgallery.data.model.ImageMetadataFts
@@ -18,11 +19,43 @@ interface ImageMetadataDao {
     @Upsert
     suspend fun upsertAll(metadata: List<ImageMetadata>)
 
+    /**
+     * Raw FTS insert. Compile-time forbidden except via [replaceFts]: the FTS
+     * table is virtual and carries no unique constraint, so REPLACE cannot
+     * deduplicate and every bare call appends a duplicate row. ERROR-level
+     * deprecation (not just docs) is the enforcement Room's schema leaves us.
+     */
+    @Deprecated(
+        "Call replaceFts: bare FTS inserts duplicate rows (no unique constraint).",
+        level = DeprecationLevel.ERROR,
+    )
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertFts(fts: ImageMetadataFts)
 
+    /**
+     * Raw FTS delete. Compile-time forbidden except via [replaceFts]; a lone
+     * delete strands the record text-unfindable.
+     */
+    @Deprecated(
+        "Call replaceFts: a lone delete strands the FTS row.",
+        level = DeprecationLevel.ERROR,
+    )
     @Query("DELETE FROM image_metadata_fts WHERE contentUri = :uri")
     suspend fun deleteFtsByUri(uri: String)
+
+    /**
+     * The only legal FTS write path: delete-then-insert inside one
+     * transaction, exactly one row per URI for any caller.
+     */
+    @Suppress("DEPRECATION_ERROR")
+    @Transaction
+    suspend fun replaceFts(fts: ImageMetadataFts) {
+        deleteFtsByUri(fts.contentUri)
+        upsertFts(fts)
+    }
+
+    @Query("SELECT * FROM image_metadata ORDER BY dateTaken DESC")
+    suspend fun getAll(): List<ImageMetadata>
 
     @Query("SELECT * FROM image_metadata ORDER BY dateTaken DESC")
     fun observeAll(): Flow<List<ImageMetadata>>
@@ -36,8 +69,60 @@ interface ImageMetadataDao {
     @Query("SELECT contentUri FROM image_metadata")
     suspend fun getAllProcessedUris(): List<String>
 
-    @Query("SELECT COUNT(*) FROM image_metadata")
+    @Query("SELECT contentUri FROM image_metadata_fts")
+    suspend fun getFtsUris(): List<String>
+
+    @Query("SELECT * FROM image_metadata_fts WHERE contentUri = :uri")
+    suspend fun getFtsByUri(uri: String): ImageMetadataFts?
+
+    /**
+     * URIs whose FULL record landed: metadata with a linked embedding plus
+     * live embedding and FTS rows. This is the definition of done (see
+     * `IndexPolicy.isComplete`); partial rows from an interrupted run are
+     * excluded so they stay eligible and are never counted.
+     *
+     * Blank-description guard mirrors `isBlank()`: SQLite TRIM strips spaces
+     * only, so the trim set covers tab/LF/VT/FF/CR explicitly, otherwise a
+     * tab-only corrupt row would count as done here while the policy treats
+     * it as not done.
+     */
+    @Query(
+        """
+        SELECT m.contentUri FROM image_metadata AS m
+        WHERE m.embeddingId IS NOT NULL
+          AND TRIM(m.description, ' ' || CHAR(9) || CHAR(10) || CHAR(11) || CHAR(12) || CHAR(13)) != ''
+          AND EXISTS (SELECT 1 FROM image_embeddings AS e WHERE e.contentUri = m.contentUri)
+          AND EXISTS (SELECT 1 FROM image_metadata_fts AS f WHERE f.contentUri = m.contentUri)
+        """
+    )
+    suspend fun getCompleteUris(): List<String>
+
+    /**
+     * Home screen indexed count: complete records only. A second run over an
+     * unchanged library writes nothing new, so this is stable across runs,
+     * and half-written rows never inflate it.
+     */
+    @Query(
+        """
+        SELECT COUNT(*) FROM image_metadata AS m
+        WHERE m.embeddingId IS NOT NULL
+          AND TRIM(m.description, ' ' || CHAR(9) || CHAR(10) || CHAR(11) || CHAR(12) || CHAR(13)) != ''
+          AND EXISTS (SELECT 1 FROM image_embeddings AS e WHERE e.contentUri = m.contentUri)
+          AND EXISTS (SELECT 1 FROM image_metadata_fts AS f WHERE f.contentUri = m.contentUri)
+        """
+    )
     fun observeCount(): Flow<Int>
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM image_metadata AS m
+        WHERE m.embeddingId IS NOT NULL
+          AND TRIM(m.description, ' ' || CHAR(9) || CHAR(10) || CHAR(11) || CHAR(12) || CHAR(13)) != ''
+          AND EXISTS (SELECT 1 FROM image_embeddings AS e WHERE e.contentUri = m.contentUri)
+          AND EXISTS (SELECT 1 FROM image_metadata_fts AS f WHERE f.contentUri = m.contentUri)
+        """
+    )
+    suspend fun getIndexedCount(): Int
 
     @Query("SELECT COUNT(*) FROM image_metadata WHERE isMeme = 1")
     fun observeMemeCount(): Flow<Int>

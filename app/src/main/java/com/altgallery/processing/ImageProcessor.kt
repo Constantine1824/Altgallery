@@ -2,6 +2,7 @@ package com.altgallery.processing
 
 import com.altgallery.data.model.ImageMetadata
 import com.altgallery.data.model.MediaImage
+import com.altgallery.data.repository.MediaRepository
 import com.altgallery.data.repository.MetadataRepository
 import com.altgallery.ml.BitmapLoader
 import com.altgallery.ml.CaptionEngine
@@ -26,6 +27,19 @@ import javax.inject.Singleton
  * captioning, or embedding throws, the exception propagates and no partial row
  * is written — the photo is simply not marked done. Batching, skip-sets, and
  * failure policies build on top of this and live outside it.
+ *
+ * Stamp-timing race: an edit that lands while the slow stages run would leave
+ * a record the mtime freshness check can never flag (the edit predates the
+ * write). [process] therefore snapshots the library row at intake and the
+ * save step re-reads it immediately before the transaction — after caption
+ * and embedding, the two slowest stages — throwing [StaleSnapshotException]
+ * on any move, so the photo stays pending and the next run indexes the new
+ * bytes. A vanished row throws [PhotoGoneException]. The leftover window
+ * between that re-read and the transaction commit is NOT closed by Room
+ * atomicity (the transaction covers only the database writes, never the
+ * MediaStore edit); it is caught on the next run by the second-aware mtime
+ * check ([IndexPolicy.isFresh]), since the edit's quantized mtime lands on or
+ * after the floored index second.
  */
 @Singleton
 class ImageProcessor @Inject constructor(
@@ -37,15 +51,19 @@ class ImageProcessor @Inject constructor(
     private val tagExtractor: TagExtractor,
     private val embeddingEngine: EmbeddingEngine,
     private val metadataRepository: MetadataRepository,
+    private val mediaRepository: MediaRepository,
 ) {
     /**
      * Runs the full per-photo pipeline and persists the complete record.
      *
      * @return the persisted [ImageMetadata] with [ImageMetadata.embeddingId] set.
-     * @throws Exception if any stage fails; nothing is written in that case.
+     * @throws Exception if any stage fails, the row moves mid-run
+     * ([StaleSnapshotException]), or the photo vanishes ([PhotoGoneException]);
+     * nothing is written in all cases.
      */
     suspend fun process(image: MediaImage): ImageMetadata {
         val uri = image.contentUri
+        val before = snapshotOf(image)
         val bitmap = bitmapLoader.load(uri)
         try {
             // ML stages first — all must succeed before anything is recorded.
@@ -54,9 +72,13 @@ class ImageProcessor @Inject constructor(
             val labelTexts = labels.map { it.text }
 
             // Pure tail owns the wiring (normalize → effective dims → classify
-            // → describe → tag → assemble → embed-then-save). Stage lambdas
-            // close over the Android objects; the tail itself is JVM-testable
-            // (see RecordAssembler.processPhoto).
+            // → describe → tag → assemble → embed-then-guard-then-save). Stage
+            // lambdas close over the Android objects; the tail itself is
+            // JVM-testable (see RecordAssembler.processPhoto). The guard is a
+            // required tail argument, not a caller-side detail: the tail
+            // re-reads the row after embed — the slowest stage — so an edit
+            // anywhere in our own window, including inside caption/embed,
+            // discards the result before the transaction opens.
             return RecordAssembler.processPhoto(
                 contentUri = image.uriString,
                 displayName = image.displayName,
@@ -69,6 +91,10 @@ class ImageProcessor @Inject constructor(
                 ocrRaw = ocr.text,
                 labelTexts = labelTexts,
                 processedAt = System.currentTimeMillis(),
+                snapshotBefore = before,
+                snapshotRequery = {
+                    mediaRepository.queryByUri(image.uriString)?.let(::snapshotOf)
+                },
                 classify = { _, _, width, height ->
                     memeClassifier.classify(ocr, labels, width, height, bitmap)
                 },
@@ -89,5 +115,34 @@ class ImageProcessor @Inject constructor(
 
         /** Placeholder folder assignment until M5 clustering runs. */
         const val UNCLUSTERED = RecordAssembler.UNCLUSTERED
+    }
+}
+
+/** Maps a library row to its Android-free snapshot (kept out of [IndexPolicy] so it stays JVM-pure). */
+internal fun snapshotOf(image: MediaImage): IndexPolicy.LibraryPhoto =
+    IndexPolicy.LibraryPhoto(
+        contentUri = image.uriString,
+        width = image.width,
+        height = image.height,
+        dateTaken = image.dateTaken,
+        dateModified = image.dateModified,
+    )
+
+/**
+ * Stale-snapshot guard behind the save step, exercised two ways: directly
+ * with a fake requery (see `SnapshotGuardTest`), and structurally through
+ * the tail — [RecordAssembler.processPhoto] takes the snapshot pair as
+ * required arguments and runs this before `save`, so the `process()` wiring
+ * cannot drop or reorder it without failing `PipelineWiringTest`:
+ * a vanished row throws [PhotoGoneException], a moved row throws
+ * [StaleSnapshotException], an identical row passes silently.
+ */
+internal suspend fun guardSnapshot(
+    before: IndexPolicy.LibraryPhoto,
+    requery: suspend () -> IndexPolicy.LibraryPhoto?,
+) {
+    val after = requery() ?: throw PhotoGoneException(before.contentUri)
+    if (IndexPolicy.snapshotChanged(before, after)) {
+        throw StaleSnapshotException(before.contentUri)
     }
 }

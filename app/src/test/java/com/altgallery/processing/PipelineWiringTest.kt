@@ -22,8 +22,22 @@ import org.junit.Test
  *   mirroring the saved metadata.
  * - AC5: an embed throw skips the save (photo stays not done).
  * - AC3: no shared state between photos.
+ * - Guard wiring: the tail takes the snapshot pair as required arguments and
+ *   re-reads after embed but before save — a moved row throws
+ *   [StaleSnapshotException] with nothing saved (embed already ran), a
+ *   vanished row throws [PhotoGoneException]. Deleting the guard from the
+ *   tail, or `ImageProcessor.process` bypassing it, fails here because the
+ *   guard is structural to the only save path.
  */
 class PipelineWiringTest {
+
+    private fun photo(
+        uri: String = "content://media/1",
+        width: Int = 800,
+        height: Int = 600,
+        dateTaken: Long = 1000L,
+        dateModified: Long = 1500L,
+    ) = IndexPolicy.LibraryPhoto(uri, width, height, dateTaken, dateModified)
 
     private data class Saved(
         val metadata: ImageMetadata,
@@ -49,6 +63,8 @@ class PipelineWiringTest {
             ocrRaw = "hello",
             labelTexts = listOf("Cat"),
             processedAt = 2L,
+            snapshotBefore = photo(),
+            snapshotRequery = { photo() },
             classify = { _, _, width, height ->
                 seenByClassifier += width to height
                 false
@@ -84,6 +100,8 @@ class PipelineWiringTest {
             ocrRaw = "hello",
             labelTexts = listOf("Cat"),
             processedAt = 2L,
+            snapshotBefore = photo(uri = "content://media/2"),
+            snapshotRequery = { photo(uri = "content://media/2") },
             classify = { _, _, _, _ -> false },
             describe = { "a photo of cat" },
             tag = { _, _ -> listOf("cat", "photo") },
@@ -120,6 +138,8 @@ class PipelineWiringTest {
                 ocrRaw = "",
                 labelTexts = emptyList(),
                 processedAt = 2L,
+                snapshotBefore = photo(uri = "content://media/3"),
+                snapshotRequery = { photo(uri = "content://media/3") },
                 classify = { _, _, _, _ -> false },
                 describe = { "an image" },
                 tag = { _, _ -> listOf("image") },
@@ -158,6 +178,8 @@ class PipelineWiringTest {
                 ocrRaw = ocrRaw,
                 labelTexts = labels,
                 processedAt = 2L,
+                snapshotBefore = photo(uri = uri),
+                snapshotRequery = { photo(uri = uri) },
                 classify = { _, _, _, _ -> false },
                 describe = { description },
                 tag = { _, _ -> tags },
@@ -193,5 +215,80 @@ class PipelineWiringTest {
             assertFalse(second.metadata.tags.contains(leak, ignoreCase = true))
         }
         assertTrue(second.fts.description.isNotBlank())
+    }
+
+    // Guard wiring: the tail re-reads after embed and before save.
+
+    @Test
+    fun `moved snapshot throws stale with nothing saved but embed ran`() = runBlocking {
+        var saved = false
+        var embedded = false
+        try {
+            RecordAssembler.processPhoto(
+                contentUri = "content://media/9",
+                displayName = "IMG_0009.jpg",
+                dateTaken = 1L,
+                mimeType = "image/jpeg",
+                imageWidth = 800,
+                imageHeight = 600,
+                bitmapWidth = null,
+                bitmapHeight = null,
+                ocrRaw = "hello",
+                labelTexts = listOf("Cat"),
+                processedAt = 2L,
+                snapshotBefore = photo(uri = "content://media/9"),
+                snapshotRequery = { photo(uri = "content://media/9", width = 1024) },
+                classify = { _, _, _, _ -> false },
+                describe = { "a photo of cat" },
+                tag = { _, _ -> listOf("cat", "photo") },
+                embed = {
+                    embedded = true
+                    floatArrayOf(1f)
+                },
+                save = { metadata, _, _ ->
+                    saved = true
+                    metadata
+                },
+            )
+            throw AssertionError("expected StaleSnapshotException")
+        } catch (expected: StaleSnapshotException) {
+            // Expected: edit during the slow stages discards the result.
+        }
+        assertTrue(embedded)
+        assertFalse(saved)
+    }
+
+    @Test
+    fun `vanished snapshot throws gone with nothing saved`() = runBlocking {
+        var saved = false
+        try {
+            RecordAssembler.processPhoto(
+                contentUri = "content://media/9",
+                displayName = "IMG_0009.jpg",
+                dateTaken = 1L,
+                mimeType = "image/jpeg",
+                imageWidth = 800,
+                imageHeight = 600,
+                bitmapWidth = null,
+                bitmapHeight = null,
+                ocrRaw = "hello",
+                labelTexts = listOf("Cat"),
+                processedAt = 2L,
+                snapshotBefore = photo(uri = "content://media/9"),
+                snapshotRequery = { null },
+                classify = { _, _, _, _ -> false },
+                describe = { "a photo of cat" },
+                tag = { _, _ -> listOf("cat", "photo") },
+                embed = { floatArrayOf(1f) },
+                save = { metadata, _, _ ->
+                    saved = true
+                    metadata
+                },
+            )
+            throw AssertionError("expected PhotoGoneException")
+        } catch (expected: PhotoGoneException) {
+            // Expected: deleted mid-run writes nothing.
+        }
+        assertFalse(saved)
     }
 }
