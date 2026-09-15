@@ -47,8 +47,9 @@ import javax.inject.Singleton
  * MediaImage↔[BatchPhoto] total mapping inside [runOnce], which plain-JVM
  * tests cannot construct (`android.net.Uri` has no JVM implementation).
  *
- * Note: no production caller invokes [runOnce] yet; the batch/WorkManager
- * wiring that will own scheduling lives in M4.
+ * Production driver: [com.altgallery.work.IndexingWorker] invokes [runOnce]
+ * on a background dispatcher; [com.altgallery.work.IndexingScheduler]
+ * enqueues it on every cold start and on permission grant.
  */
 @Singleton
 class IndexingPipeline @Inject constructor(
