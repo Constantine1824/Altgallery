@@ -22,6 +22,12 @@ import org.junit.Test
  * - AC05: a missing model is reported once via [ModelsMissingException] —
  *   checked once before any attempt, and a mid-run model loss aborts the
  *   batch instead of repeating one failure per photo.
+ * - Persistence wiring: [BatchRunner.runBatch] takes `recordFailures` as a
+ *   required argument and calls it once per non-empty run with that run's
+ *   failures (empty clears the log); an empty run records nothing.
+ * - Spacing: attempts pause between tries ([BatchRunner.defaultRetryDelayMs]
+ *   via an injectable nap) instead of burning the budget back-to-back; no
+ *   pause after settling.
  */
 class BatchRunnerTest {
 
@@ -50,8 +56,13 @@ class BatchRunnerTest {
         items: List<BatchPhoto>,
         processPhoto: suspend (BatchPhoto) -> ImageMetadata,
         checkModelsReady: suspend () -> Unit = {},
+        recordFailures: suspend (List<PhotoFailure>) -> Unit = {},
+        retryDelayMs: (Int) -> Long = { 0L },
+        nap: suspend (Long) -> Unit = {},
         onPhotoSettled: suspend (done: Int, total: Int) -> Unit = { _, _ -> },
-    ): RunSummary = BatchRunner.runBatch(items, checkModelsReady, processPhoto, onPhotoSettled)
+    ): RunSummary = BatchRunner.runBatch(
+        items, checkModelsReady, processPhoto, recordFailures, retryDelayMs, nap, onPhotoSettled,
+    )
 
     // AC01: one bad photo is the only casualty.
 
@@ -282,5 +293,144 @@ class BatchRunnerTest {
         } catch (expected: CancellationException) {
             // Expected: cooperative cancellation propagates untouched.
         }
+    }
+
+    // Persistence wiring: the required recordFailures callback.
+
+    @Test
+    fun `failures are handed to recordFailures once per run`() = runBlocking {
+        val recorded = mutableListOf<List<PhotoFailure>>()
+        val summary = run(
+            items = listOf(photo("content://media/1"), photo("content://media/2")),
+            processPhoto = { item ->
+                if (item.contentUri == "content://media/2") throw IllegalStateException("bad file")
+                recordFor(item)
+            },
+            recordFailures = { recorded += it },
+        )
+
+        assertEquals(1, recorded.size)
+        assertEquals(summary.failures, recorded.single())
+    }
+
+    @Test
+    fun `clean run records an empty list to clear the log`() = runBlocking {
+        val recorded = mutableListOf<List<PhotoFailure>>()
+        val summary = run(
+            items = listOf(photo()),
+            processPhoto = { recordFor(it) },
+            recordFailures = { recorded += it },
+        )
+
+        assertTrue(summary.failures.isEmpty())
+        assertEquals(1, recorded.size)
+        assertTrue(recorded.single().isEmpty())
+    }
+
+    @Test
+    fun `empty run records nothing and preserves the previous log`() = runBlocking {
+        val recorded = mutableListOf<List<PhotoFailure>>()
+        run(
+            items = emptyList(),
+            processPhoto = { recordFor(it) },
+            recordFailures = { recorded += it },
+        )
+
+        assertTrue(recorded.isEmpty())
+    }
+
+    @Test
+    fun `readiness throw records nothing`() = runBlocking {
+        val recorded = mutableListOf<List<PhotoFailure>>()
+        var processCalls = 0
+        try {
+            run(
+                items = listOf(photo()),
+                checkModelsReady = { throw ModelsMissingException("missing") },
+                processPhoto = {
+                    processCalls++
+                    recordFor(it)
+                },
+                recordFailures = { recorded += it },
+            )
+            fail("expected ModelsMissingException")
+        } catch (expected: ModelsMissingException) {
+            // Expected: aborted before any attempt, nothing to persist.
+        }
+        assertEquals(0, processCalls)
+        assertTrue(recorded.isEmpty())
+    }
+
+    // Spacing: pauses between attempts, never after settling.
+
+    @Test
+    fun `default backoff doubles from 250ms`() {
+        assertEquals(250L, BatchRunner.defaultRetryDelayMs(1))
+        assertEquals(500L, BatchRunner.defaultRetryDelayMs(2))
+    }
+
+    @Test
+    fun `persistent failure pauses between attempts with the default schedule`() = runBlocking {
+        val naps = mutableListOf<Long>()
+        val summary = BatchRunner.runBatch(
+            items = listOf(photo()),
+            checkModelsReady = {},
+            processPhoto = { throw IllegalStateException("boom") },
+            recordFailures = {},
+            nap = { naps += it },
+        )
+
+        assertEquals(listOf(250L, 500L), naps)
+        assertEquals(1, summary.failedCount)
+    }
+
+    @Test
+    fun `no pause on first-try success`() = runBlocking {
+        val naps = mutableListOf<Long>()
+        BatchRunner.runBatch(
+            items = listOf(photo()),
+            checkModelsReady = {},
+            processPhoto = { recordFor(it) },
+            recordFailures = {},
+            nap = { naps += it },
+        )
+
+        assertTrue(naps.isEmpty())
+    }
+
+    @Test
+    fun `single pause when the second attempt succeeds`() = runBlocking {
+        val naps = mutableListOf<Long>()
+        var calls = 0
+        val item = photo()
+        val summary = BatchRunner.runBatch(
+            items = listOf(item),
+            checkModelsReady = {},
+            processPhoto = {
+                calls++
+                if (calls == 1) throw IllegalStateException("transient")
+                recordFor(item)
+            },
+            recordFailures = {},
+            nap = { naps += it },
+        )
+
+        assertEquals(listOf(250L), naps)
+        assertEquals(1, summary.succeededCount)
+    }
+
+    @Test
+    fun `custom schedule is honored`() = runBlocking {
+        val naps = mutableListOf<Long>()
+        BatchRunner.runBatch(
+            items = listOf(photo()),
+            checkModelsReady = {},
+            processPhoto = { throw IllegalStateException("boom") },
+            recordFailures = {},
+            retryDelayMs = { 42L },
+            nap = { naps += it },
+        )
+
+        assertEquals(listOf(42L, 42L), naps)
     }
 }

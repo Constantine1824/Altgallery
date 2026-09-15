@@ -6,6 +6,7 @@ import com.altgallery.data.db.AltGalleryDatabase
 import com.altgallery.data.db.EmbeddingDao
 import com.altgallery.data.db.FolderDao
 import com.altgallery.data.db.ImageMetadataDao
+import com.altgallery.data.db.ProcessingFailureDao
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -32,4 +33,8 @@ object AppModule {
 
     @Provides
     fun provideFolderDao(db: AltGalleryDatabase): FolderDao = db.folderDao()
+
+    @Provides
+    fun provideProcessingFailureDao(db: AltGalleryDatabase): ProcessingFailureDao =
+        db.processingFailureDao()
 }
