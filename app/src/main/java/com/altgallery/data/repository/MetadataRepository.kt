@@ -173,6 +173,32 @@ class MetadataRepository @Inject constructor(
         }
     }
 
+    /**
+     * Appends one slice's failures without clearing slices that already
+     * landed. Continuation slices use this (first slices use
+     * [recordRunFailures], which replaces): each slice's failures survive
+     * process death immediately, and filtering already-logged URIs (see
+     * `filterUnattempted`) keeps the next slice from retrying them in the
+     * same pass. A no-op when empty so a clean slice preserves prior slices.
+     */
+    suspend fun appendRunFailures(failures: List<PhotoFailure>) {
+        if (failures.isEmpty()) return
+        val now = System.currentTimeMillis()
+        db.withTransaction {
+            failureDao.upsertAll(
+                failures.map {
+                    ProcessingFailure(
+                        contentUri = it.contentUri,
+                        displayName = it.displayName,
+                        reason = it.reason,
+                        attempts = it.attempts,
+                        failedAt = now,
+                    )
+                },
+            )
+        }
+    }
+
     /** Last run's failure log, newest first. Empty when the last run was clean. */
     suspend fun getRecordedFailures(): List<ProcessingFailure> = failureDao.getAll()
 

@@ -5,6 +5,11 @@ import com.altgallery.data.model.MediaImage
 import com.altgallery.data.repository.MediaRepository
 import com.altgallery.data.repository.MetadataRepository
 import com.altgallery.ml.EmbeddingEngine
+import com.altgallery.work.MAX_PHOTOS_PER_EXECUTION
+import com.altgallery.work.RUN_TIME_BUDGET_MS
+import com.altgallery.work.filterUnattempted
+import com.altgallery.work.needsContinuation
+import com.altgallery.work.shouldStopSlice
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -47,9 +52,11 @@ import javax.inject.Singleton
  * MediaImage↔[BatchPhoto] total mapping inside [runOnce], which plain-JVM
  * tests cannot construct (`android.net.Uri` has no JVM implementation).
  *
- * Production driver: [com.altgallery.work.IndexingWorker] invokes [runOnce]
- * on a background dispatcher; [com.altgallery.work.IndexingScheduler]
- * enqueues it on every cold start and on permission grant.
+ * Production driver: [com.altgallery.work.IndexingWorker] invokes [runSlice]
+ * (bounded: count + time budget, foreground, appended continuation) on a
+ * background dispatcher; [com.altgallery.work.IndexingScheduler] enqueues it
+ * on every cold start and on permission grant. [runOnce] remains for the
+ * unbounded single-pass shape the JVM tests pin.
  */
 @Singleton
 class IndexingPipeline @Inject constructor(
@@ -86,7 +93,95 @@ class IndexingPipeline @Inject constructor(
             onPhotoSettled = onProgress,
         )
     }
+
+    /**
+     * One bounded execution of the current library pass (the 10-minute-cap
+     * fix). Settles at most [maxPhotos] unattempted photos, stopping earlier
+     * on the time budget or [isStopped], then reports whether the pass needs
+     * another execution ([SliceResult.hasMore], via `needsContinuation`).
+     *
+     * Resumption: a fresh pass ([isContinuation] false, from cold start or
+     * permission grant) attempts the whole pending set and replaces the
+     * failure log; a continuation (appended by the worker) skips URIs already
+     * logged by earlier slices of the same pass and appends its failures, so
+     * terminally-failing heads cannot starve the tail and every slice's
+     * failures survive process death. An empty pending set settles nothing
+     * and preserves the log. Models-missing throws before any attempt or
+     * persistence, as in [runOnce].
+     */
+    suspend fun runSlice(
+        maxPhotos: Int = MAX_PHOTOS_PER_EXECUTION,
+        isContinuation: Boolean = false,
+        timeBudgetMs: Long = RUN_TIME_BUDGET_MS,
+        isStopped: () -> Boolean = { false },
+        clockMs: () -> Long = { System.currentTimeMillis() },
+        onProgress: suspend (done: Int, total: Int) -> Unit = { _, _ -> },
+    ): SliceResult {
+        val pending = pending()
+        if (pending.isEmpty()) {
+            return SliceResult(
+                summary = RunSummary(attempted = 0, succeeded = emptyList(), failures = emptyList()),
+                hasMore = false,
+                pendingTotal = 0,
+                filteredTotal = 0,
+            )
+        }
+        val logged: Set<String> = if (isContinuation) {
+            metadataRepository.getRecordedFailures().map { it.contentUri }.toSet()
+        } else {
+            emptySet()
+        }
+        val unattempted = filterUnattempted(pending.map { it.uriString }, logged).toSet()
+        val filtered = pending.filter { it.uriString in unattempted }
+        if (filtered.isEmpty()) {
+            return SliceResult(
+                summary = RunSummary(attempted = 0, succeeded = emptyList(), failures = emptyList()),
+                hasMore = false,
+                pendingTotal = pending.size,
+                filteredTotal = 0,
+            )
+        }
+        val slice = filtered.take(maxPhotos)
+        val byUri = pending.associateBy { it.uriString }
+        val started = clockMs()
+        val summary = executeRun(
+            items = slice.map { BatchPhoto(it.uriString, it.displayName) },
+            checkModelsReady = {
+                if (!embeddingEngine.isReady()) throw modelsMissingError()
+            },
+            processPhoto = { item ->
+                imageProcessor.process(byUri.getValue(item.contentUri))
+            },
+            recordFailures = { failures ->
+                if (isContinuation) metadataRepository.appendRunFailures(failures)
+                else metadataRepository.recordRunFailures(failures)
+            },
+            onPhotoSettled = onProgress,
+            shouldStop = { shouldStopSlice(clockMs() - started, isStopped(), timeBudgetMs) },
+        )
+        return SliceResult(
+            summary = summary,
+            hasMore = needsContinuation(filtered.size, summary.attempted),
+            pendingTotal = pending.size,
+            filteredTotal = filtered.size,
+        )
+    }
 }
+
+/**
+ * What one bounded execution accomplished plus whether the library pass
+ * needs another execution. `hasMore` is true while unattempted photos from
+ * this pass remain (count bound left a tail or the slice stopped early);
+ * the worker appends a continuation then. Failed photos stay pending for
+ * the NEXT pass, not the next slice — continuations skip logged URIs so one
+ * bad head cannot starve the tail.
+ */
+data class SliceResult(
+    val summary: RunSummary,
+    val hasMore: Boolean,
+    val pendingTotal: Int,
+    val filteredTotal: Int,
+)
 
 /**
  * The JVM-testable orchestration behind [IndexingPipeline.runOnce]:
@@ -103,12 +198,14 @@ internal suspend fun executeRun(
     processPhoto: suspend (BatchPhoto) -> ImageMetadata,
     recordFailures: suspend (List<PhotoFailure>) -> Unit,
     onPhotoSettled: suspend (done: Int, total: Int) -> Unit = { _, _ -> },
+    shouldStop: () -> Boolean = { false },
 ): RunSummary = BatchRunner.runBatch(
     items = items,
     checkModelsReady = checkModelsReady,
     processPhoto = processPhoto,
     recordFailures = recordFailures,
     onPhotoSettled = onPhotoSettled,
+    shouldStop = shouldStop,
 )
 
 /**

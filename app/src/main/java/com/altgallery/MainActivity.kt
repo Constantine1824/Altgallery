@@ -98,7 +98,8 @@ private fun PlaceholderHome(
     // retry button). Survives rotation so a denial is asked once.
     var granted by rememberSaveable { mutableStateOf<Boolean?>(null) }
     // Guards the schedule trigger across recreation: rotation must not
-    // re-enqueue (REPLACE would cancel the in-flight run). Fresh processes
+    // re-enqueue (a second enqueue mid-run is wasted work even though the
+    // scheduler's KEEP policy makes it a no-op). Fresh processes
     // start false, so cold starts and fresh grants always schedule.
     var scheduled by rememberSaveable { mutableStateOf(false) }
     fun noteGranted() {
