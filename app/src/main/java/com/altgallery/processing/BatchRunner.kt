@@ -96,6 +96,22 @@ class ModelsMissingException(message: String, cause: Throwable? = null) :
  * the policy is pinned by plain-JVM tests; `IndexingPipeline.runOnce` only
  * maps library rows onto [BatchPhoto] and delegates here, so this is the
  * single policy path for batch runs.
+ *
+ * Time ceiling (INDX-004 follow-up): [shouldStop] is checked before each
+ * photo AND inside the per-photo retry loop (before every retry attempt and
+ * before every pause), so a slice yields cooperatively before WorkManager's
+ * ~10-minute cap instead of being killed mid-run — checking only between
+ * photos would let 50 photos × 3 slow attempts run ~20 minutes worst case.
+ * An early stop returns a partial summary (`attempted == succeeded + failed
+ * == settled so far`, still balanced). A photo cut short by the budget is
+ * left unsettled (pending and unlogged, NOT recorded as a failure) so the
+ * appended continuation retries it in the same pass; only exhausted photos
+ * are recorded. `recordFailures` runs once per non-empty run even when zero
+ * photos settled: for a fresh pass that is the replace that drops the
+ * previous pass's log (so a stopped-first-slice's continuation retries
+ * everything instead of mistaking the old log for this pass's attempt log),
+ * while a continuation's append of an empty list is a no-op preserving its
+ * pass's slices (see `IndexingPipeline.runSlice`).
  */
 object BatchRunner {
 
@@ -119,6 +135,7 @@ object BatchRunner {
         retryDelayMs: (failedAttempt: Int) -> Long = ::defaultRetryDelayMs,
         nap: suspend (Long) -> Unit = { delay(it) },
         onPhotoSettled: suspend (done: Int, total: Int) -> Unit = { _, _ -> },
+        shouldStop: () -> Boolean = { false },
     ): RunSummary {
         if (items.isEmpty()) {
             return RunSummary(attempted = 0, succeeded = emptyList(), failures = emptyList())
@@ -127,11 +144,20 @@ object BatchRunner {
 
         val succeeded = ArrayList<ImageMetadata>(items.size)
         val failures = ArrayList<PhotoFailure>()
-        for ((index, item) in items.withIndex()) {
+        for (item in items) {
+            if (shouldStop()) break
             var attempts = 0
             var record: ImageMetadata? = null
             var lastError: Exception? = null
+            var cutShort = false
             while (attempts < MAX_ATTEMPTS) {
+                // Budget check inside the retry loop: without it a slice of
+                // slow photos would burn all remaining attempts past the
+                // execution ceiling before the next between-photo check.
+                if (attempts > 0 && shouldStop()) {
+                    cutShort = true
+                    break
+                }
                 attempts++
                 try {
                     record = processPhoto(item)
@@ -141,7 +167,7 @@ object BatchRunner {
                     throw e
                 } catch (e: ModelUnavailableException) {
                     throw ModelsMissingException(
-                        "Model unavailable mid-run after $index of ${items.size} " +
+                        "Model unavailable mid-run after ${succeeded.size + failures.size} of ${items.size} " +
                             "photos settled; aborting the batch so the missing model is " +
                             "reported once: ${reasonOf(e)}",
                         e,
@@ -149,10 +175,15 @@ object BatchRunner {
                 } catch (e: Exception) {
                     lastError = e
                     if (attempts < MAX_ATTEMPTS) {
+                        if (shouldStop()) {
+                            cutShort = true
+                            break
+                        }
                         nap(retryDelayMs(attempts))
                     }
                 }
             }
+            if (cutShort) break
             if (record != null) {
                 succeeded += record
             } else {
@@ -163,13 +194,20 @@ object BatchRunner {
                     attempts = attempts,
                 )
             }
-            onPhotoSettled(index + 1, items.size)
+            onPhotoSettled(succeeded.size + failures.size, items.size)
         }
+        // Settled count, not items.size: identical for a full run, smaller
+        // after a cooperative stop — the invariant still holds by construction.
         val summary = RunSummary(
-            attempted = items.size,
+            attempted = succeeded.size + failures.size,
             succeeded = succeeded,
             failures = failures,
         )
+        // Unconditional for a non-empty run (even zero settled): a fresh
+        // pass's replace-with-empty drops the previous pass's log so the
+        // continuation cannot mistake it for this pass's attempt log, while
+        // a continuation's append-with-empty is a no-op. The empty-items
+        // early return above is what preserves the log on idle runs.
         recordFailures(summary.failures)
         return summary
     }

@@ -16,8 +16,8 @@ import androidx.core.content.ContextCompat
  * (POST_NOTIFICATIONS, for processing progress, is requested separately in M4/M8.)
  *
  * This is a plain utility usable from both a ViewModel and a Composable; the
- * actual request UI (rememberLauncherForActivityResult / rationale dialog) is
- * wired up with the Home screen in M7.
+ * request itself is issued once from the home screen (`MainActivity`), which
+ * starts background indexing on grant and stays idle on denial.
  */
 object MediaPermissions {
 
