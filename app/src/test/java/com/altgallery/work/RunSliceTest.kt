@@ -35,6 +35,13 @@ class RunSliceTest {
     }
 
     @Test
+    fun `custom budget is honored`() {
+        assertFalse(shouldStopSlice(10L, false, budgetMs = 50L))
+        assertTrue(shouldStopSlice(50L, false, budgetMs = 50L))
+        assertTrue(shouldStopSlice(0L, true, budgetMs = 50L))
+    }
+
+    @Test
     fun `logged uris are skipped so a bad head cannot starve the tail`() {
         val pending = listOf("a", "b", "c")
         assertEquals(listOf("a", "b", "c"), filterUnattempted(pending, emptySet()))

@@ -433,4 +433,99 @@ class BatchRunnerTest {
 
         assertEquals(listOf(42L, 42L), naps)
     }
+
+    // Time ceiling: the stop flag is consulted inside the retry loop, not
+    // just between photos, and a cut-short photo stays unsettled for the
+    // continuation instead of being recorded or retried past the budget.
+
+    @Test
+    fun `stop before first photo settles nothing yet still records empty`() = runBlocking {
+        val recorded = mutableListOf<List<PhotoFailure>>()
+        val settled = mutableListOf<Pair<Int, Int>>()
+        var processCalls = 0
+
+        val summary = BatchRunner.runBatch(
+            items = listOf(photo(), photo("content://media/2", "IMG_0002.jpg")),
+            checkModelsReady = {},
+            processPhoto = {
+                processCalls++
+                recordFor(it)
+            },
+            recordFailures = { recorded += it },
+            nap = {},
+            onPhotoSettled = { done, total -> settled += done to total },
+            shouldStop = { true },
+        )
+
+        assertEquals(0, summary.attempted)
+        assertEquals(0, summary.succeededCount)
+        assertEquals(0, summary.failedCount)
+        assertEquals(0, processCalls)
+        // A fresh pass's replace-with-empty: drops the previous pass's log
+        // so the continuation cannot mistake it for this pass's attempt log
+        // (a continuation's append-with-empty is a no-op instead).
+        assertEquals(1, recorded.size)
+        assertTrue(recorded.single().isEmpty())
+        assertTrue(settled.isEmpty())
+    }
+
+    @Test
+    fun `stop inside retry loop abandons remaining attempts without recording`() = runBlocking {
+        val recorded = mutableListOf<List<PhotoFailure>>()
+        val settled = mutableListOf<Pair<Int, Int>>()
+        val naps = mutableListOf<Long>()
+        var processCalls = 0
+
+        val summary = BatchRunner.runBatch(
+            items = listOf(photo()),
+            checkModelsReady = {},
+            processPhoto = {
+                processCalls++
+                throw IllegalStateException("slow failure")
+            },
+            recordFailures = { recorded += it },
+            nap = { naps += it },
+            onPhotoSettled = { done, total -> settled += done to total },
+            shouldStop = { processCalls >= 1 },
+        )
+
+        // One attempt, not three: no burning the remaining budget, no pause.
+        assertEquals(1, processCalls)
+        assertTrue(naps.isEmpty())
+        // Cut short, not exhausted: unsettled (pending, unlogged) for the
+        // continuation, never recorded as a failure.
+        assertEquals(0, summary.attempted)
+        assertEquals(0, summary.failedCount)
+        assertEquals(1, recorded.size)
+        assertTrue(recorded.single().isEmpty())
+        assertTrue(settled.isEmpty())
+    }
+
+    @Test
+    fun `stop after first photo keeps its settlement and skips the rest`() = runBlocking {
+        val recorded = mutableListOf<List<PhotoFailure>>()
+        val settled = mutableListOf<Pair<Int, Int>>()
+        var processCalls = 0
+
+        val summary = BatchRunner.runBatch(
+            items = listOf(photo("content://media/1"), photo("content://media/2")),
+            checkModelsReady = {},
+            processPhoto = {
+                processCalls++
+                recordFor(it)
+            },
+            recordFailures = { recorded += it },
+            nap = {},
+            onPhotoSettled = { done, total -> settled += done to total },
+            shouldStop = { processCalls >= 1 },
+        )
+
+        assertEquals(1, processCalls)
+        assertEquals(1, summary.attempted)
+        assertEquals(1, summary.succeededCount)
+        assertEquals(0, summary.failedCount)
+        assertEquals(1, recorded.size)
+        assertTrue(recorded.single().isEmpty())
+        assertEquals(listOf(1 to 2), settled)
+    }
 }

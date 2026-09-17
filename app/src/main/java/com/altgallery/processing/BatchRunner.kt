@@ -98,11 +98,20 @@ class ModelsMissingException(message: String, cause: Throwable? = null) :
  * single policy path for batch runs.
  *
  * Time ceiling (INDX-004 follow-up): [shouldStop] is checked before each
- * photo so a slice yields cooperatively before WorkManager's ~10-minute cap
- * instead of being killed mid-run. An early stop returns a partial summary
- * (`attempted == succeeded + failed == settled so far`, still balanced) and
- * still persists that slice's failures — unsettled photos stay pending for
- * the appended continuation (see `com.altgallery.work.needsContinuation`).
+ * photo AND inside the per-photo retry loop (before every retry attempt and
+ * before every pause), so a slice yields cooperatively before WorkManager's
+ * ~10-minute cap instead of being killed mid-run — checking only between
+ * photos would let 50 photos × 3 slow attempts run ~20 minutes worst case.
+ * An early stop returns a partial summary (`attempted == succeeded + failed
+ * == settled so far`, still balanced). A photo cut short by the budget is
+ * left unsettled (pending and unlogged, NOT recorded as a failure) so the
+ * appended continuation retries it in the same pass; only exhausted photos
+ * are recorded. `recordFailures` runs once per non-empty run even when zero
+ * photos settled: for a fresh pass that is the replace that drops the
+ * previous pass's log (so a stopped-first-slice's continuation retries
+ * everything instead of mistaking the old log for this pass's attempt log),
+ * while a continuation's append of an empty list is a no-op preserving its
+ * pass's slices (see `IndexingPipeline.runSlice`).
  */
 object BatchRunner {
 
@@ -140,7 +149,15 @@ object BatchRunner {
             var attempts = 0
             var record: ImageMetadata? = null
             var lastError: Exception? = null
+            var cutShort = false
             while (attempts < MAX_ATTEMPTS) {
+                // Budget check inside the retry loop: without it a slice of
+                // slow photos would burn all remaining attempts past the
+                // execution ceiling before the next between-photo check.
+                if (attempts > 0 && shouldStop()) {
+                    cutShort = true
+                    break
+                }
                 attempts++
                 try {
                     record = processPhoto(item)
@@ -158,10 +175,15 @@ object BatchRunner {
                 } catch (e: Exception) {
                     lastError = e
                     if (attempts < MAX_ATTEMPTS) {
+                        if (shouldStop()) {
+                            cutShort = true
+                            break
+                        }
                         nap(retryDelayMs(attempts))
                     }
                 }
             }
+            if (cutShort) break
             if (record != null) {
                 succeeded += record
             } else {
@@ -181,9 +203,12 @@ object BatchRunner {
             succeeded = succeeded,
             failures = failures,
         )
-        if (summary.attempted > 0) {
-            recordFailures(summary.failures)
-        }
+        // Unconditional for a non-empty run (even zero settled): a fresh
+        // pass's replace-with-empty drops the previous pass's log so the
+        // continuation cannot mistake it for this pass's attempt log, while
+        // a continuation's append-with-empty is a no-op. The empty-items
+        // early return above is what preserves the log on idle runs.
+        recordFailures(summary.failures)
         return summary
     }
 

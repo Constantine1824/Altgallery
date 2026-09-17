@@ -44,8 +44,14 @@ import kotlinx.coroutines.yield
  *   so a healed backend recovers. A killed run is safe to repeat: completed
  *   photos are skipped via the already-processed definition, failed ones
  *   stay pending.
- * - Cancellation always propagates (including from the per-photo pause), so
- *   a replaced run stops promptly.
+ * - Cancellation propagates, but a system stop (`isStopped`: the cap or a
+ *   constraints change killing the run mid-photo, where even the retry-loop
+ *   budget checks never get a word in) first enqueues a best-effort
+ *   continuation so the pass resumes without waiting for a cold start.
+ *   `enqueueContinuation` is non-suspending, so it runs on the cancelled
+ *   coroutine; a spurious extra slice (pass already complete) is a cheap
+ *   no-op that settles nothing and chains nothing further. A hard process
+ *   kill still falls back to the next cold start's fresh pass.
  *
  * Responsiveness: [CoroutineWorker] runs on a background dispatcher, the
  * repositories already confine I/O off the main thread, and the per-photo
@@ -88,6 +94,13 @@ class IndexingWorker @AssistedInject constructor(
             }
             Result.success()
         } catch (e: CancellationException) {
+            if (isStopped) {
+                try {
+                    IndexingScheduler.enqueueContinuation(applicationContext)
+                } catch (ignored: Exception) {
+                    Log.w(TAG, "Could not enqueue continuation after stop", ignored)
+                }
+            }
             throw e
         } catch (e: Exception) {
             when (actionForRunThrow(e, runAttemptCount)) {

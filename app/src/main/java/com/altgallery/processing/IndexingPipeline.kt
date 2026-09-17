@@ -102,12 +102,15 @@ class IndexingPipeline @Inject constructor(
      *
      * Resumption: a fresh pass ([isContinuation] false, from cold start or
      * permission grant) attempts the whole pending set and replaces the
-     * failure log; a continuation (appended by the worker) skips URIs already
-     * logged by earlier slices of the same pass and appends its failures, so
-     * terminally-failing heads cannot starve the tail and every slice's
-     * failures survive process death. An empty pending set settles nothing
-     * and preserves the log. Models-missing throws before any attempt or
-     * persistence, as in [runOnce].
+     * failure log — including the zero-settled case, so a fresh slice stopped
+     * before its first photo still drops the previous pass's log and its
+     * continuation cannot mistake that log for this pass's attempt log; a
+     * continuation (appended by the worker) skips URIs already logged by
+     * earlier slices of the same pass and appends its failures (an empty
+     * append is a no-op), so terminally-failing heads cannot starve the tail
+     * and every slice's failures survive process death. An empty pending set
+     * settles nothing and preserves the log. Models-missing throws before any
+     * attempt or persistence, as in [runOnce].
      */
     suspend fun runSlice(
         maxPhotos: Int = MAX_PHOTOS_PER_EXECUTION,
